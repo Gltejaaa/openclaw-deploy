@@ -59,11 +59,20 @@ if (Test-Path $msiDir) {
     }
 }
 
-# Shell 脚本
+# Shell 脚本（确保 OpenClaw_Shell.ps1 有 UTF-8 BOM，否则中文会乱码）
+$ensureBom = Join-Path $root "scripts\ensure-utf8bom.ps1"
+if (Test-Path $ensureBom) {
+    & $ensureBom | Out-Null
+}
 $shellScript = Join-Path $root "scripts\OpenClaw_Shell_Install.cmd"
 if (Test-Path $shellScript) {
     Copy-Item $shellScript $releaseDir
     Write-Host "  - OpenClaw_Shell_Install.cmd" -ForegroundColor Green
+}
+$shellPs1 = Join-Path $root "scripts\OpenClaw_Shell.ps1"
+if (Test-Path $shellPs1) {
+    Copy-Item $shellPs1 $releaseDir
+    Write-Host "  - OpenClaw_Shell.ps1" -ForegroundColor Green
 }
 
 # 使用文档

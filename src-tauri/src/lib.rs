@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
+#[cfg(target_os = "windows")]
+use encoding_rs::GBK;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::env;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use regex::Regex;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -23,6 +25,16 @@ fn hide_console_window(cmd: &mut Command) {
 
 #[cfg(not(target_os = "windows"))]
 fn hide_console_window(_cmd: &mut Command) {}
+
+#[cfg(not(target_os = "windows"))]
+fn find_npm_path_fallback() -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn env_with_node_path() -> Vec<(String, String)> {
+    Vec::new()
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EnvCheckResult {
@@ -150,20 +162,76 @@ fn find_npm_path() -> Option<String> {
     }
 }
 
+/// 当 node 不在 PATH 时，尝试从常见安装路径查找 npm（快捷方式/资源管理器启动时 PATH 可能不完整）
+#[cfg(target_os = "windows")]
+fn find_npm_path_fallback() -> Option<String> {
+    let program_files = env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+    let program_files_x86 = env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
+    let appdata = env::var("APPDATA").unwrap_or_default();
+    let candidates = [
+        format!("{}\\nodejs\\npm.cmd", program_files.trim().replace('/', "\\")),
+        "C:\\Program Files\\nodejs\\npm.cmd".to_string(),
+        format!("{}\\nodejs\\npm.cmd", program_files_x86.trim().replace('/', "\\")),
+        format!("{}\\npm\\npm.cmd", appdata.trim().replace('/', "\\")),
+    ];
+    for p in &candidates {
+        if Path::new(p).exists() {
+            return Some(p.clone());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn env_with_node_path() -> Vec<(String, String)> {
+    let mut extra = Vec::new();
+    let program_files = env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+    let appdata = env::var("APPDATA").unwrap_or_default();
+    let program_files_x86 = env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
+    let node_paths = [
+        format!("{}\\nodejs", program_files.trim().replace('/', "\\")),
+        format!("{}\\npm", appdata.trim().replace('/', "\\")),
+        format!("{}\\nodejs", program_files_x86.trim().replace('/', "\\")),
+    ];
+    let current_path = env::var("Path").unwrap_or_default();
+    let existing: std::collections::HashSet<String> = current_path
+        .split(';')
+        .map(|s| s.trim().trim_end_matches('\\').to_lowercase())
+        .collect();
+    let mut prepend: Vec<String> = node_paths
+        .iter()
+        .filter(|p| Path::new(p).exists())
+        .filter(|p| !existing.contains(p.to_lowercase().trim_end_matches('\\')))
+        .map(|s| s.clone())
+        .collect();
+    if !prepend.is_empty() {
+        prepend.push(current_path);
+        extra.push(("Path".to_string(), prepend.join(";")));
+    }
+    extra
+}
+
 fn run_npm_cmd(args: &[&str]) -> std::io::Result<std::process::Output> {
     #[cfg(target_os = "windows")]
     {
         let args_str: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        if let Some(npm_path) = find_npm_path() {
+        let npm_path = find_npm_path().or_else(find_npm_path_fallback);
+        if let Some(np) = npm_path {
             let mut cmd = Command::new("cmd");
             hide_console_window(&mut cmd);
-            cmd.args(["/c", &npm_path]);
+            cmd.args(["/c", &np]);
             cmd.args(&args_str);
+            for (k, v) in env_with_node_path() {
+                cmd.env(k, v);
+            }
             return cmd.output();
         }
         let cmd_str = format!("npm {}", args.join(" "));
         let mut cmd = Command::new("cmd");
         hide_console_window(&mut cmd);
+        for (k, v) in env_with_node_path() {
+            cmd.env(k, v);
+        }
         cmd.args(["/c", &cmd_str]).output()
     }
     #[cfg(not(target_os = "windows"))]
@@ -171,6 +239,34 @@ fn run_npm_cmd(args: &[&str]) -> std::io::Result<std::process::Output> {
         let mut cmd = Command::new("npm");
         cmd.args(args);
         cmd.output()
+    }
+}
+
+#[tauri::command]
+fn check_git() -> EnvCheckResult {
+    let mut cmd = Command::new("git");
+    hide_console_window(&mut cmd);
+    let output = cmd.arg("--version").output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let msg = if version.is_empty() {
+                "Git 已安装".to_string()
+            } else {
+                format!("{} 已安装", version)
+            };
+            EnvCheckResult {
+                ok: true,
+                version: Some(version),
+                message: msg,
+            }
+        }
+        _ => EnvCheckResult {
+            ok: false,
+            version: None,
+            message: "未检测到 Git。npm 安装 OpenClaw 时可能需要 Git，若出现 spawn git 错误请先安装: https://git-scm.com/download/win".to_string(),
+        },
     }
 }
 
@@ -208,7 +304,28 @@ fn check_npm() -> EnvCheckResult {
 fn check_openclaw(install_hint: Option<String>) -> EnvCheckResult {
     let hint = install_hint.as_deref().filter(|s| !s.trim().is_empty());
     let exe = find_openclaw_executable(hint).unwrap_or_else(|| "openclaw".to_string());
-    let output = run_openclaw_cmd(&exe, &["--version"], None);
+    let mut output = run_openclaw_cmd(&exe, &["--version"], None);
+
+    // openclaw.cmd 在部分环境下会报「系统找不到指定路径」，改用 node 直接运行 mjs 兜底
+    if let Ok(ref out) = output {
+        if !out.status.success() {
+            if let Some(install_dir) = Path::new(&exe).parent() {
+                let core_mjs = install_dir.join("node_modules").join("openclaw").join("openclaw.mjs");
+                if core_mjs.exists() {
+                    let mut node_cmd = Command::new("node");
+                    #[cfg(target_os = "windows")]
+                    hide_console_window(&mut node_cmd);
+                    node_cmd.arg(&core_mjs).arg("--version");
+                    node_cmd.current_dir(install_dir);
+                    if let Ok(node_out) = node_cmd.output() {
+                        if node_out.status.success() {
+                            output = Ok(node_out);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     match output {
         Ok(out) => {
@@ -219,7 +336,7 @@ fn check_openclaw(install_hint: Option<String>) -> EnvCheckResult {
                     message: "OpenClaw 未安装，点击「一键安装」进行安装".to_string(),
                 };
             }
-            let version = strip_ansi_text(&String::from_utf8_lossy(&out.stdout)).trim().to_string();
+            let version = strip_ansi_text(&decode_console_output(&out.stdout)).trim().to_string();
             let msg = format!("OpenClaw 已安装 ({})", if version.is_empty() { "已安装" } else { &version });
             EnvCheckResult {
                 ok: true,
@@ -326,25 +443,78 @@ fn remove_path_from_user_env(_path_to_remove: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct NpmPathCheckResult {
+    in_path: bool,
+    path: String,
+}
+
+#[tauri::command]
+fn check_npm_path_in_user_env() -> Result<NpmPathCheckResult, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::RegKey;
+        let appdata = env::var("APPDATA").map_err(|_| "无法获取 APPDATA".to_string())?;
+        let npm_path = format!("{}\\npm", appdata.trim().replace('/', "\\"));
+        let hkcu = RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+        let env_key = hkcu
+            .open_subkey("Environment")
+            .map_err(|e| format!("无法打开注册表: {}", e))?;
+        let current: String = env_key.get_value("Path").unwrap_or_else(|_| String::new());
+        let in_path = current
+            .split(';')
+            .any(|s: &str| s.trim().eq_ignore_ascii_case(&npm_path));
+        Ok(NpmPathCheckResult {
+            in_path,
+            path: npm_path.clone(),
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(NpmPathCheckResult {
+            in_path: true,
+            path: String::new(),
+        })
+    }
+}
+
+#[tauri::command]
+fn add_npm_to_path() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = env::var("APPDATA").map_err(|_| "无法获取 APPDATA".to_string())?;
+        let npm_path = format!("{}\\npm", appdata.trim().replace('/', "\\"));
+        add_path_to_user_env(&npm_path)?;
+        Ok(format!(
+            "已成功将 {} 添加到用户 PATH。请关闭并重新打开 CMD/PowerShell 后生效。",
+            npm_path
+        ))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok("当前系统无需此操作".to_string())
+    }
+}
+
 fn run_npm_cmd_streaming(args: &[&str], app: &tauri::AppHandle) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     {
         let args_str: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let mut child = if let Some(np) = find_npm_path() {
-            let mut cmd = Command::new("cmd");
-            hide_console_window(&mut cmd);
+        let npm_path = find_npm_path().or_else(find_npm_path_fallback);
+        let cmd_str = format!("npm {}", args.join(" "));
+        let mut cmd = Command::new("cmd");
+        hide_console_window(&mut cmd);
+        for (k, v) in env_with_node_path() {
+            cmd.env(k, v);
+        }
+        if let Some(np) = npm_path {
             cmd.args(["/c", &np]);
             cmd.args(&args_str);
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-            cmd.spawn()
         } else {
-            let cmd_str = format!("npm {}", args.join(" "));
-            let mut cmd = Command::new("cmd");
-            hide_console_window(&mut cmd);
             cmd.args(["/c", &cmd_str]);
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-            cmd.spawn()
-        }.map_err(|e| format!("启动失败: {}", e))?;
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("启动失败: {}", e))?;
         let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
         let stderr = child.stderr.take().ok_or("无法获取 stderr")?;
         let app_stdout = app.clone();
@@ -422,12 +592,30 @@ fn install_openclaw_full(app: tauri::AppHandle, install_dir: String) -> Result<I
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {}", e))?;
     }
     emit_install_step(&app, "prepare_dir", "done", "安装目录已就绪");
+
+    // 安装前检测 Node/npm：快捷方式启动时 PATH 可能不完整，先检测再调用 npm
+    let npm_ok = run_npm_cmd(&["--version"]).map(|o| o.status.success()).unwrap_or(false);
+    if !npm_ok {
+        emit_install_step(&app, "npm_install", "error", "未检测到 Node.js/npm");
+        return Err("未检测到 Node.js 或 npm。请先安装 Node.js 22+：https://nodejs.org\n\n若已安装，请从「开始菜单」或「环境检测」页面重新打开本应用。".to_string());
+    }
+
+    // 检测 Git：npm 安装 openclaw 时部分依赖可能需要 Git
+    let has_git = Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+    if !has_git {
+        let _ = app.emit("install-output", "[提示] 未检测到 Git，若安装失败并提示 spawn git，请先安装: https://git-scm.com/download/win");
+    }
     emit_install_step(&app, "npm_install", "running", "正在下载并安装 OpenClaw（耗时 10-60 秒）");
     let args = vec!["install", "-g", "openclaw", "--prefix", &dir];
     let success = run_npm_cmd_streaming(&args, &app).map_err(|e| format!("执行失败: {}", e))?;
     if !success {
         emit_install_step(&app, "npm_install", "error", "npm 安装失败");
-        return Err("安装失败，请查看上方输出".to_string());
+        let hint = if !has_git {
+            "\n\n若错误含 spawn git，请先安装 Git: https://git-scm.com/download/win"
+        } else {
+            ""
+        };
+        return Err(format!("安装失败，请查看上方输出。{}", hint));
     }
     emit_install_step(&app, "npm_install", "done", "npm 安装完成");
 
@@ -444,7 +632,12 @@ fn install_openclaw_full(app: tauri::AppHandle, install_dir: String) -> Result<I
         let retry_success = run_npm_cmd_streaming(&args, &app).map_err(|e| format!("执行失败: {}", e))?;
         if !retry_success {
             emit_install_step(&app, "verify_files", "error", "自动重试失败");
-            return Err("安装重试失败，请检查网络并重试".to_string());
+            let hint = if !has_git {
+                " 若错误含 spawn git，请先安装 Git: https://git-scm.com/download/win"
+            } else {
+                ""
+            };
+            return Err(format!("安装重试失败，请检查网络并重试。{}", hint));
         }
         files_ok = Path::new(&exe_path).exists() && Path::new(&core_path).exists();
     }
@@ -458,13 +651,28 @@ fn install_openclaw_full(app: tauri::AppHandle, install_dir: String) -> Result<I
     emit_install_step(&app, "verify_files", "done", "核心文件校验通过");
 
     emit_install_step(&app, "verify_cli", "running", "验证 openclaw 命令可执行");
-    let version_output = run_openclaw_cmd(&exe_path, &["--version"], None)
+    let mut version_output = run_openclaw_cmd(&exe_path, &["--version"], None)
         .map_err(|e| format!("验证失败: {}", e))?;
+    // openclaw.cmd 在部分环境下会报「系统找不到指定路径」，改用 node 直接运行 mjs 验证
+    if !version_output.status.success() {
+        let mut node_cmd = Command::new("node");
+        hide_console_window(&mut node_cmd);
+        node_cmd.arg(&core_path).arg("--version");
+        node_cmd.current_dir(&dir);
+        if let Ok(out) = node_cmd.output() {
+            if out.status.success() {
+                version_output = out;
+            }
+        }
+    }
     if !version_output.status.success() {
         emit_install_step(&app, "verify_cli", "error", "命令验证失败");
-        let out = String::from_utf8_lossy(&version_output.stdout);
-        let err = String::from_utf8_lossy(&version_output.stderr);
-        return Err(format!("安装后命令不可用：\n{}\n{}", out, err));
+        let out = decode_console_output(&version_output.stdout);
+        let err = decode_console_output(&version_output.stderr);
+        return Err(format!(
+            "安装文件已写入 {}，但命令执行失败（openclaw.cmd 或 node 运行异常）。\n\n{}\n{}\n\n建议：用脚本选择「自定义目录」安装到 D:\\openclow，或检查 Node.js 是否正常。",
+            dir, out, err
+        ));
     }
     emit_install_step(&app, "verify_cli", "done", "命令验证通过");
 
@@ -476,6 +684,10 @@ fn install_openclaw_full(app: tauri::AppHandle, install_dir: String) -> Result<I
     emit_install_step(&app, "create_config", "running", "创建配置目录");
     let config_dir = format!("{}/.openclaw", dir.replace('\\', "/"));
     std::fs::create_dir_all(&config_dir).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    // OpenClaw 2026+ 要求 gateway.mode，否则 Gateway 拒绝启动
+    let openclaw_json_path = format!("{}/openclaw.json", config_dir);
+    let minimal_config = r#"{"gateway":{"mode":"local"}}"#;
+    let _ = std::fs::write(&openclaw_json_path, minimal_config);
     emit_install_step(&app, "create_config", "done", "配置目录创建完成");
     Ok(InstallResult {
         config_dir: config_dir.clone(),
@@ -491,13 +703,75 @@ fn recommended_install_dir() -> Result<String, String> {
     Ok(format!("{}/openclaw", home.replace('\\', "/")))
 }
 
-/// 查找 openclaw 可执行文件路径。优先使用配置路径推导的安装目录。
+/// Windows: 从注册表读取用户 PATH（桌面应用启动时进程可能未加载最新 PATH）
+#[cfg(target_os = "windows")]
+fn get_user_path_from_registry() -> Vec<String> {
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    let env_key = match hkcu.open_subkey("Environment") {
+        Ok(k) => k,
+        Err(_) => return vec![],
+    };
+    let path_val: String = env_key.get_value("Path").unwrap_or_default();
+    path_val
+        .split(';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_user_path_from_registry() -> Vec<String> {
+    vec![]
+}
+
+/// 查找 openclaw 可执行文件路径。
+/// 始终优先扫描 PATH 和固定路径，不依赖 install_hint（热迁移后可能过期）。
 fn find_openclaw_executable(config_path: Option<&str>) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        // 1. 优先使用传入路径推导安装目录：
-        // - 若为 X/.openclaw，安装目录是 X
-        // - 若为普通目录，视为安装目录
+        let mut seen = std::collections::HashSet::new();
+        let mut scan_path = |entry: &str| {
+            let entry = entry.trim();
+            if entry.is_empty() || seen.contains(entry) {
+                return None;
+            }
+            seen.insert(entry.to_string());
+            let exe = Path::new(entry).join("openclaw.cmd");
+            if exe.exists() {
+                Some(exe.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        };
+        // 1. 注册表用户 PATH（脚本/安装写入后，进程可能未刷新）
+        for entry in get_user_path_from_registry() {
+            if let Some(exe) = scan_path(&entry) {
+                return Some(exe);
+            }
+        }
+        // 2. 当前进程 PATH
+        if let Ok(path_env) = env::var("PATH") {
+            for entry in path_env.split(';') {
+                if let Some(exe) = scan_path(entry) {
+                    return Some(exe);
+                }
+            }
+        }
+        // 3. 显式检查常见自定义安装路径（热迁移常用）
+        for fixed in ["D:\\openclow", "C:\\openclow", "D:\\openclaw", "C:\\openclaw"] {
+            let exe = Path::new(fixed).join("openclaw.cmd");
+            if exe.exists() {
+                return Some(exe.to_string_lossy().to_string());
+            }
+        }
+        if let Ok(home) = env::var("USERPROFILE") {
+            let exe = Path::new(&home).join("openclaw").join("openclaw.cmd");
+            if exe.exists() {
+                return Some(exe.to_string_lossy().to_string());
+            }
+        }
+        // 3. 传入路径（install_hint 可能指向已迁移/删除的旧路径，仅作兜底）
         if let Some(cp) = config_path.filter(|s| !s.trim().is_empty()) {
             let p = Path::new(cp.trim());
             let install_dir = if p.file_name().and_then(|s| s.to_str()).map(|s| s == ".openclaw").unwrap_or(false) {
@@ -512,13 +786,12 @@ fn find_openclaw_executable(config_path: Option<&str>) -> Option<String> {
                 }
             }
         }
-        // 2. 尝试 npm root -g：root 为 node_modules，可执行文件在 parent (prefix)
+        // 4. npm root -g（可能指向已删除的源安装）
         if let Ok(out) = run_npm_cmd(&["root", "-g"]) {
             if out.status.success() {
                 let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !root.is_empty() {
-                    let prefix = Path::new(&root).parent();
-                    if let Some(p) = prefix {
+                    if let Some(p) = Path::new(&root).parent() {
                         let exe = p.join("openclaw.cmd");
                         if exe.exists() {
                             return Some(exe.to_string_lossy().to_string());
@@ -527,7 +800,7 @@ fn find_openclaw_executable(config_path: Option<&str>) -> Option<String> {
                 }
             }
         }
-        // 3. 常见路径
+        // 5. APPDATA\npm（可能指向已删除的源安装）
         if let Ok(appdata) = env::var("APPDATA") {
             let exe = Path::new(&appdata).join("npm").join("openclaw.cmd");
             if exe.exists() {
@@ -1179,6 +1452,7 @@ fn write_env_config(
     if !cfg.is_object() {
         cfg = json!({});
     }
+    ensure_gateway_mode_local(&mut cfg);
     let root = cfg.as_object_mut().expect("config root");
     let agents = root.entry("agents".to_string()).or_insert_with(|| json!({}));
     if !agents.is_object() {
@@ -1423,29 +1697,56 @@ fn run_openclaw_cmd(exe: &str, args: &[&str], env_extra: Option<(&str, &str)>) -
     #[cfg(target_os = "windows")]
     {
         if exe.to_ascii_lowercase().ends_with(".cmd") || exe.to_ascii_lowercase().ends_with(".bat") {
-            let esc = |s: &str| s.replace('\'', "''");
-            let joined_args = if args.is_empty() {
-                String::new()
+            let exe_path = Path::new(exe);
+            let work_dir = exe_path.parent().filter(|p| p.as_os_str().len() > 0);
+            let exe_abs: String = if exe_path.exists() {
+                let canonical = std::fs::canonicalize(exe_path)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| exe.to_string());
+                // cmd.exe 不支持 \\?\ 长路径前缀，需去掉
+                if canonical.starts_with("\\\\?\\") {
+                    canonical.strip_prefix("\\\\?\\").unwrap_or(&canonical).to_string()
+                } else {
+                    canonical
+                }
             } else {
-                format!(
-                    " {}",
-                    args.iter()
-                        .map(|a| format!("'{}'", esc(a)))
-                        .collect::<Vec<String>>()
-                        .join(" ")
-                )
+                exe.to_string()
             };
-            let script = format!("& '{}'{}", esc(exe), joined_args);
-            let mut cmd = Command::new("powershell");
+            // 使用 cmd /c 运行 .cmd；路径无空格时不要加引号，避免 cmd 解析错误
+            let exe_part = if exe_abs.contains(' ') {
+                format!("\"{}\"", exe_abs.replace('"', "\"\""))
+            } else {
+                exe_abs.clone()
+            };
+            let args_part: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if a.contains(' ') {
+                        format!("\"{}\"", a.replace('"', "\"\""))
+                    } else {
+                        (*a).to_string()
+                    }
+                })
+                .collect();
+            let full_cmd = if args_part.is_empty() {
+                exe_part
+            } else {
+                format!("{} {}", exe_part, args_part.join(" "))
+            };
+            let mut cmd = Command::new("cmd");
             hide_console_window(&mut cmd);
-            cmd.args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &script,
-            ]);
+            cmd.args(["/c", &full_cmd]);
+            if let Some(dir) = work_dir {
+                let _ = cmd.current_dir(dir);
+            }
+            // 安装目录加入 PATH，确保 openclaw.cmd 内部能解析 node 等依赖
+            if let Some(dir) = work_dir {
+                let dir_str = dir.to_string_lossy();
+                if let Ok(current_path) = env::var("PATH") {
+                    let new_path = format!("{};{}", dir_str, current_path);
+                    cmd.env("PATH", new_path);
+                }
+            }
             if let Some((k, v)) = env_extra {
                 cmd.env(k, v);
             }
@@ -1515,10 +1816,28 @@ fn strip_ansi_text(input: &str) -> String {
     re.replace_all(input, "").to_string()
 }
 
+/// Windows 控制台输出多为 GBK，需正确解码避免乱码（如「系统找不到指定路径」）
+#[cfg(target_os = "windows")]
+fn decode_console_output(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    let (cow, _, _) = GBK.decode(bytes);
+    cow.to_string()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn decode_console_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_string()
+}
+
 fn run_openclaw_cmd_clean(exe: &str, args: &[&str], env_extra: Option<(&str, &str)>) -> Result<(bool, String, String), String> {
     let output = run_openclaw_cmd(exe, args, env_extra).map_err(|e| format!("执行失败: {}", e))?;
-    let stdout = strip_ansi_text(&String::from_utf8_lossy(&output.stdout));
-    let stderr = strip_ansi_text(&String::from_utf8_lossy(&output.stderr));
+    let stdout = strip_ansi_text(&decode_console_output(&output.stdout));
+    let stderr = strip_ansi_text(&decode_console_output(&output.stderr));
     Ok((output.status.success(), stdout, stderr))
 }
 
@@ -1548,8 +1867,14 @@ fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> R
         .map(|s| s.trim().replace('\\', "/"))
         .filter(|s| !s.is_empty());
     let config_path = config_dir.as_deref();
-    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(config_path))
-        .unwrap_or_else(|| "openclaw".to_string());
+    let exe = match find_openclaw_executable(install_hint_norm.as_deref().or(config_path)) {
+        Some(e) => e,
+        None => {
+            return Err(
+                "未找到 openclaw 可执行文件。请确认：\n1. 已安装 OpenClaw（在「安装 OpenClaw」页面完成安装）\n2. 若为热迁移，请将 D:\\openclow 或 C:\\openclow 加入系统 PATH\n3. 在「安装 OpenClaw」页面点击「刷新」重新检测".to_string(),
+            );
+        }
+    };
     let state_dir = config_dir.clone();
     if let Some(dir) = state_dir.as_deref() {
         let _ = merge_legacy_channels_json(dir);
@@ -1561,6 +1886,11 @@ fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> R
         }
     }
     let env_extra = state_dir.as_ref().map(|s| ("OPENCLAW_STATE_DIR", s.as_str()));
+
+    // 启动前清理旧进程，避免端口被占用
+    let _ = run_openclaw_cmd_clean(&exe, &["gateway", "stop"], env_extra);
+    std::thread::sleep(Duration::from_secs(2));
+
     let (ok, stdout, stderr) = run_openclaw_cmd_clean(&exe, &["gateway", "start"], env_extra)?;
     if ok {
         return Ok(format!("Gateway 已启动\n{}", stdout));
@@ -1568,26 +1898,53 @@ fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> R
 
     let combined = format!("{}\n{}", stdout, stderr);
     let lower = combined.to_lowercase();
-    if lower.contains("program not found")
+    // 幂等：已在运行时视为成功
+    if lower.contains("already running")
+        || lower.contains("already started")
+        || lower.contains("已在运行")
+    {
+        return Ok("Gateway 已在运行".to_string());
+    }
+    let diag = format!(
+        "可执行文件：{}\n配置目录：{}",
+        exe,
+        state_dir.as_deref().unwrap_or("(未设置)")
+    );
+    let path_error = lower.contains("program not found")
         || lower.contains("not recognized as an internal or external command")
         || lower.contains("系统找不到指定的文件")
-        || lower.contains("no such file or directory")
-    {
+        || lower.contains("no such file or directory");
+    if path_error {
+        // gateway.cmd 可能指向已删除路径，尝试强制重写后重试
+        let (install_ok, _, _) =
+            run_openclaw_cmd_clean(&exe, &["gateway", "install", "--force"], env_extra)?;
+        if install_ok {
+            std::thread::sleep(Duration::from_secs(1));
+            let (start_ok2, stdout2, _) =
+                run_openclaw_cmd_clean(&exe, &["gateway", "start"], env_extra)?;
+            if start_ok2 {
+                return Ok(format!("Gateway 已修复并启动\n{}", stdout2));
+            }
+        }
         return Err(format!(
-            "找不到 openclaw 可执行文件（program not found）。\n请在「安装 OpenClaw」里确认安装目录（例如 D 盘路径）并重新安装/保存。\n当前解析到的可执行路径：{}",
-            exe
+            "找不到 openclaw 可执行文件。\n{}\n\n请确认：\n1. D:\\openclow 或 C:\\openclow 下存在 openclaw.cmd\n2. 若为热迁移，请将新安装目录加入 PATH\n3. 在「安装 OpenClaw」页面点击「刷新」重新检测",
+            diag
         ));
     }
     if combined.contains("MODULE_NOT_FOUND") || combined.contains("Cannot find module") {
-        return Err("检测到 OpenClaw 安装不完整（缺少核心模块）。请返回「安装 OpenClaw」重新安装。".to_string());
+        return Err(format!(
+            "检测到 OpenClaw 安装不完整（缺少核心模块）。\n{}\n请返回「安装 OpenClaw」重新安装。",
+            diag
+        ));
     }
     let missing_service = combined.contains("Gateway service missing")
         || combined.contains("gateway install")
         || combined.contains("schtasks");
 
     if missing_service {
+        // 使用 --force 强制重新生成 gateway.cmd，避免热迁删除源后仍指向旧路径
         let (install_ok, install_out, install_err) =
-            run_openclaw_cmd_clean(&exe, &["gateway", "install"], env_extra)?;
+            run_openclaw_cmd_clean(&exe, &["gateway", "install", "--force"], env_extra)?;
         if !install_ok {
             return Err(format!(
                 "检测到网关服务未安装，已尝试自动安装但失败。\n{}\n{}",
@@ -1605,7 +1962,10 @@ fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> R
         ));
     }
 
-    Err(format!("启动失败:\n{}\n{}", stdout, stderr))
+    Err(format!(
+        "启动失败\n{}\n\n命令输出：\nstdout: {}\nstderr: {}",
+        diag, stdout, stderr
+    ))
 }
 
 #[tauri::command]
@@ -1627,9 +1987,57 @@ fn stop_gateway(custom_path: Option<String>, install_hint: Option<String>) -> Re
     }
 }
 
+/// 前台启动 Gateway：在新 cmd 窗口运行 openclaw gateway，计划任务失败时的替代方案
+#[tauri::command]
+fn start_gateway_foreground(custom_path: Option<String>, install_hint: Option<String>) -> Result<String, String> {
+    let config_dir = custom_path
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| resolve_openclaw_dir(None));
+    let install_hint_norm = install_hint
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(Some(config_dir.as_str())))
+        .ok_or("未找到 openclaw 可执行文件，请先完成安装。".to_string())?;
+    if let Ok(mut root) = load_openclaw_config(&config_dir) {
+        ensure_gateway_mode_local(&mut root);
+        let _ = save_openclaw_config(&config_dir, &root);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let exe_win = exe.replace('/', "\\");
+        let config_win = config_dir.replace('/', "\\");
+        let exe_dir = Path::new(&exe).parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| config_dir.clone());
+        let cmdline = format!(
+            "set OPENCLAW_STATE_DIR={} && \"{}\" gateway",
+            config_win,
+            exe_win
+        );
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/c", "start", "", "cmd", "/k", &cmdline]);
+        cmd.current_dir(&exe_dir);
+        cmd.output().map_err(|e| format!("打开新窗口失败: {}", e))?;
+        Ok("已在新窗口启动 Gateway，请保持该窗口不关闭。就绪后访问: http://127.0.0.1:18789/".to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (config_dir, exe);
+        Err("当前平台暂不支持前台启动".to_string())
+    }
+}
+
 #[tauri::command]
 fn fix_node() -> Result<String, String> {
     Ok("https://nodejs.org".to_string())
+}
+
+#[tauri::command]
+fn fix_git() -> Result<String, String> {
+    Ok("https://git-scm.com/download/win".to_string())
 }
 
 #[tauri::command]
@@ -1951,6 +2359,116 @@ fn save_channel_config(
             "{} 渠道配置已保存到 channels.json：{}。{}",
             channel, openclaw_dir, tip
         ))
+    }
+}
+
+/// 共用逻辑：判断渠道配置是否有效（与 Shell 脚本保持一致）
+fn is_channel_configured(channel_id: &str, ch: &Value) -> bool {
+    let obj = match ch.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+    let non_empty = |v: Option<&Value>| {
+        v.and_then(|x| x.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    };
+    match channel_id {
+        "telegram" => non_empty(obj.get("botToken")),
+        "discord" => non_empty(obj.get("token")) || non_empty(obj.get("botToken")),
+        "feishu" | "dingtalk" => {
+            let check_acc = |acc: &Value| {
+                let o = acc.as_object()?;
+                let (id_key, secret_key) = if channel_id == "feishu" {
+                    ("appId", "appSecret")
+                } else {
+                    ("appKey", "appSecret")
+                };
+                let id_ok = non_empty(o.get(id_key));
+                let secret_ok = non_empty(o.get(secret_key));
+                Some(id_ok && secret_ok)
+            };
+            if let Some(accs) = obj.get("accounts").and_then(|v| v.as_object()) {
+                accs.values().any(|acc| check_acc(acc).unwrap_or(false))
+            } else {
+                check_acc(ch).unwrap_or(false)
+            }
+        }
+        "qq" => {
+            let app_ok = non_empty(obj.get("appId"));
+            let cred_ok = non_empty(obj.get("token")) || non_empty(obj.get("appSecret"));
+            app_ok && cred_ok
+        }
+        _ => false,
+    }
+}
+
+#[tauri::command]
+fn get_channel_config_status(custom_path: Option<String>) -> Result<Value, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut result = serde_json::Map::new();
+    let channels = ["telegram", "discord", "feishu", "dingtalk", "qq"];
+    let root = load_openclaw_config(&openclaw_dir).unwrap_or_else(|_| json!({}));
+    let chs = root
+        .as_object()
+        .and_then(|o| o.get("channels"))
+        .and_then(|c| c.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let channels_path = format!("{}/channels.json", openclaw_dir.replace('\\', "/"));
+    let chs_legacy: Map<String, Value> = if Path::new(&channels_path).exists() {
+        let txt = std::fs::read_to_string(&channels_path).unwrap_or_default();
+        serde_json::from_str(&txt).unwrap_or_else(|_| Map::new())
+    } else {
+        Map::new()
+    };
+    for id in channels {
+        let ch = chs.get(id).or_else(|| chs_legacy.get(id)).cloned().unwrap_or(json!({}));
+        result.insert(id.to_string(), json!(is_channel_configured(id, &ch)));
+    }
+    Ok(Value::Object(result))
+}
+
+#[tauri::command]
+fn remove_channel_config(channel: String, custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let channels_path = format!("{}/channels.json", openclaw_dir.replace('\\', "/"));
+    let config_path = format!("{}/openclaw.json", openclaw_dir.replace('\\', "/"));
+    let mut modified = false;
+    if Path::new(&config_path).exists() {
+        let mut root = load_openclaw_config(&openclaw_dir)?;
+        if let Some(chs) = root
+            .as_object_mut()
+            .and_then(|o| o.get_mut("channels"))
+            .and_then(|c| c.as_object_mut())
+        {
+            if chs.remove(&channel).is_some() {
+                modified = true;
+                save_openclaw_config(&openclaw_dir, &root)?;
+            }
+        }
+    }
+    if Path::new(&channels_path).exists() {
+        let txt = std::fs::read_to_string(&channels_path)
+            .map_err(|e| format!("读取 channels.json 失败: {}", e))?;
+        let mut root: Value =
+            serde_json::from_str(&txt).map_err(|e| format!("解析 channels.json 失败: {}", e))?;
+        if let Some(obj) = root.as_object_mut() {
+            if obj.remove(&channel).is_some() {
+                modified = true;
+                std::fs::write(
+                    &channels_path,
+                    serde_json::to_string_pretty(&root)
+                        .map_err(|e| format!("序列化失败: {}", e))?,
+                )
+                .map_err(|e| format!("写入失败: {}", e))?;
+            }
+        }
+    }
+    if modified {
+        Ok(format!("{} 渠道配置已清除", channel))
+    } else {
+        Ok(format!("{} 渠道无已保存配置", channel))
     }
 }
 
@@ -2492,10 +3010,24 @@ fn test_channel_connection(channel: String, config: Value) -> Result<String, Str
     let obj = config.as_object().ok_or("配置格式错误，需为对象")?;
     let required_ok = match channel.as_str() {
         "telegram" => obj.get("botToken").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false),
+        "discord" => {
+            let t = obj.get("token").or_else(|| obj.get("botToken"));
+            t.and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false)
+        }
         "feishu" => {
             let app_id = obj.get("appId").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
             let app_secret = obj.get("appSecret").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
             app_id && app_secret
+        }
+        "dingtalk" => {
+            let acc_obj = obj
+                .get("accounts")
+                .and_then(|a| a.get("main"))
+                .and_then(|v| v.as_object())
+                .or_else(|| config.as_object());
+            let app_key = acc_obj.and_then(|o| o.get("appKey")).and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
+            let app_secret = acc_obj.and_then(|o| o.get("appSecret")).and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
+            app_key && app_secret
         }
         "qq" => {
             let app_id = obj.get("appId").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
@@ -2602,12 +3134,18 @@ fn approve_pairing(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             check_node,
             check_npm,
+            check_git,
             check_openclaw,
             install_openclaw,
             install_openclaw_full,
@@ -2619,6 +3157,7 @@ pub fn run() {
             test_model_connection,
             probe_runtime_model_connection,
             start_gateway,
+            start_gateway_foreground,
             stop_gateway,
             gateway_status,
             run_onboard,
@@ -2629,6 +3168,8 @@ pub fn run() {
             uninstall_openclaw,
             save_channel_config,
             read_channel_config,
+            get_channel_config_status,
+            remove_channel_config,
             get_gateway_auth_token,
             read_runtime_model_info,
             read_key_sync_status,
@@ -2638,7 +3179,10 @@ pub fn run() {
             open_external_url,
             fix_node,
             fix_npm,
+            fix_git,
             fix_openclaw,
+            check_npm_path_in_user_env,
+            add_npm_to_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

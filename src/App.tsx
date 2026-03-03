@@ -30,6 +30,7 @@ interface ChannelConfig {
   chatId?: string;
   appId?: string;
   appSecret?: string;
+  appKey?: string;
   token?: string;
   webhook?: string;
 }
@@ -170,7 +171,12 @@ function App() {
   const [step, setStep] = useState(0);
   const [nodeCheck, setNodeCheck] = useState<EnvCheckResult | null>(null);
   const [npmCheck, setNpmCheck] = useState<EnvCheckResult | null>(null);
+  const [gitCheck, setGitCheck] = useState<EnvCheckResult | null>(null);
   const [openclawCheck, setOpenclawCheck] = useState<EnvCheckResult | null>(null);
+  const [npmPathInPath, setNpmPathInPath] = useState<boolean | null>(null);
+  const [npmPath, setNpmPath] = useState<string>("");
+  const [addingPath, setAddingPath] = useState(false);
+  const [pathAddResult, setPathAddResult] = useState<string | null>(null);
   const [checking, setChecking] = useState(true);
 
   const [installing, setInstalling] = useState(false);
@@ -208,6 +214,8 @@ function App() {
   const [telegramConfig, setTelegramConfig] = useState<ChannelConfig>({});
   const [feishuConfig, setFeishuConfig] = useState<ChannelConfig>({});
   const [qqConfig, setQqConfig] = useState<ChannelConfig>({});
+  const [discordConfig, setDiscordConfig] = useState<ChannelConfig>({});
+  const [dingtalkConfig, setDingtalkConfig] = useState<ChannelConfig>({});
   const [channelSaving, setChannelSaving] = useState<string | null>(null);
   const [channelTesting, setChannelTesting] = useState<string | null>(null);
   const [pairingLoading, setPairingLoading] = useState<string | null>(null);
@@ -240,13 +248,27 @@ function App() {
     pairing: "ok",
     detail: "未检测",
   });
+  const [discordHealth, setDiscordHealth] = useState<ChannelHealthInfo>({
+    configured: "unknown",
+    token: "unknown",
+    gateway: "unknown",
+    pairing: "ok",
+    detail: "未检测",
+  });
+  const [dingtalkHealth, setDingtalkHealth] = useState<ChannelHealthInfo>({
+    configured: "unknown",
+    token: "unknown",
+    gateway: "unknown",
+    pairing: "ok",
+    detail: "未检测",
+  });
   const [autoRefreshHealth, setAutoRefreshHealth] = useState(false);
   const [savedAiHint, setSavedAiHint] = useState<string | null>(null);
   const [localInfo, setLocalInfo] = useState<LocalOpenclawInfo | null>(null);
   const [exeCheckInfo, setExeCheckInfo] = useState<ExecutableCheckInfo | null>(null);
   const [uninstalling, setUninstalling] = useState(false);
 
-  const [fixing, setFixing] = useState<"node" | "npm" | "openclaw" | null>(null);
+  const [fixing, setFixing] = useState<"node" | "npm" | "git" | "openclaw" | null>(null);
   const [fixResult, setFixResult] = useState<string | null>(null);
   const loadedStepDataRef = useRef<{ install: boolean; model: boolean; channel: boolean }>({
     install: false,
@@ -392,6 +414,8 @@ function App() {
     };
   }, []);
 
+  const ENV_CHECK_TIMEOUT_MS = 10000;
+
   const runEnvCheck = async (installHint?: string) => {
     setChecking(true);
     try {
@@ -400,18 +424,30 @@ function App() {
         lastInstallDir.trim() ||
         customInstallPath.trim() ||
         undefined;
-      const [node, npm, openclaw] = await Promise.all([
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("环境检测超时，请检查 Node.js 是否已正确安装")), ENV_CHECK_TIMEOUT_MS)
+      );
+      const checkPromise = Promise.all([
         invoke<EnvCheckResult>("check_node"),
         invoke<EnvCheckResult>("check_npm"),
+        invoke<EnvCheckResult>("check_git"),
         invoke<EnvCheckResult>("check_openclaw", { installHint: openclawHint }),
+        invoke<{ in_path: boolean; path: string }>("check_npm_path_in_user_env"),
       ]);
+      const [node, npm, git, openclaw, pathCheck] = await Promise.race([checkPromise, timeoutPromise]);
       setNodeCheck(node);
       setNpmCheck(npm);
+      setGitCheck(git);
       setOpenclawCheck(openclaw);
+      setNpmPathInPath(pathCheck.in_path);
+      setNpmPath(pathCheck.path);
     } catch (e) {
-      setNodeCheck({ ok: false, message: `检测失败: ${e}` });
-      setNpmCheck({ ok: false, message: "检测失败" });
-      setOpenclawCheck({ ok: false, message: "检测失败" });
+      const msg = e instanceof Error ? e.message : String(e);
+      setNodeCheck({ ok: false, message: msg.includes("超时") ? msg : `检测失败: ${msg}` });
+      setNpmCheck({ ok: false, message: msg.includes("超时") ? msg : "检测失败" });
+      setGitCheck({ ok: false, message: msg.includes("超时") ? msg : "检测失败" });
+      setOpenclawCheck({ ok: false, message: msg.includes("超时") ? msg : "检测失败" });
+      setNpmPathInPath(null);
     } finally {
       setChecking(false);
     }
@@ -514,13 +550,32 @@ function App() {
     }
   };
 
+  const [channelConfigStatus, setChannelConfigStatus] = useState<
+    Record<string, boolean>
+  >({});
+  const [channelClearing, setChannelClearing] = useState<string | null>(null);
+
+  const loadChannelConfigStatus = async (cfgPath?: string) => {
+    try {
+      const customPath = normalizeConfigPath(cfgPath || customConfigPath) || undefined;
+      const status = await invoke<Record<string, boolean>>("get_channel_config_status", {
+        customPath,
+      });
+      setChannelConfigStatus(status || {});
+    } catch {
+      setChannelConfigStatus({});
+    }
+  };
+
   const loadSavedChannels = async (cfgPath?: string) => {
     try {
       const customPath = normalizeConfigPath(cfgPath || customConfigPath) || undefined;
-      const [tg, fs, qq] = await Promise.all([
+      const [tg, fs, qq, dc, dt] = await Promise.all([
         invoke<ChannelConfig>("read_channel_config", { channel: "telegram", customPath }),
         invoke<ChannelConfig>("read_channel_config", { channel: "feishu", customPath }),
         invoke<ChannelConfig>("read_channel_config", { channel: "qq", customPath }),
+        invoke<ChannelConfig>("read_channel_config", { channel: "discord", customPath }),
+        invoke<ChannelConfig>("read_channel_config", { channel: "dingtalk", customPath }),
       ]);
       setTelegramConfig({
         botToken: tg?.botToken ?? "",
@@ -534,6 +589,16 @@ function App() {
         appId: qq?.appId ?? "",
         token: qq?.token ?? "",
       });
+      setDiscordConfig({
+        token: dc?.token ?? dc?.botToken ?? "",
+        botToken: dc?.botToken ?? dc?.token ?? "",
+      });
+      const dtAcc = (dt as { accounts?: { main?: ChannelConfig } })?.accounts?.main ?? dt;
+      setDingtalkConfig({
+        appKey: dtAcc?.appKey ?? "",
+        appSecret: dtAcc?.appSecret ?? "",
+      });
+      await loadChannelConfigStatus(cfgPath || customConfigPath);
     } catch {
       // ignore load failures to keep manual input path usable
     }
@@ -709,7 +774,7 @@ function App() {
   };
 
   const handleSaveChannel = async (
-    channel: "telegram" | "feishu" | "qq",
+    channel: "telegram" | "feishu" | "qq" | "discord" | "dingtalk",
     config: ChannelConfig
   ) => {
     setChannelSaving(channel);
@@ -733,7 +798,7 @@ function App() {
   };
 
   const handleTestChannel = async (
-    channel: "telegram" | "feishu" | "qq",
+    channel: "telegram" | "feishu" | "qq" | "discord" | "dingtalk",
     config: ChannelConfig
   ) => {
     setChannelTesting(channel);
@@ -785,6 +850,29 @@ function App() {
       setChannelResult(`配对失败: ${e}`);
     } finally {
       setPairingLoading(null);
+    }
+  };
+
+  const handleClearChannel = async (channel: "telegram" | "feishu" | "qq" | "discord" | "dingtalk") => {
+    setChannelClearing(channel);
+    setChannelResult(null);
+    try {
+      const result = await invoke<string>("remove_channel_config", {
+        channel,
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      });
+      setChannelResult(result);
+      await loadSavedChannels();
+      if (channel === "telegram") setTelegramConfig({ botToken: "", chatId: "" });
+      if (channel === "feishu") setFeishuConfig({ appId: "", appSecret: "" });
+      if (channel === "qq") setQqConfig({ appId: "", token: "" });
+      if (channel === "discord") setDiscordConfig({ token: "", botToken: "" });
+      if (channel === "dingtalk") setDingtalkConfig({ appKey: "", appSecret: "" });
+    } catch (e) {
+      setChannelResult(`清除失败: ${e}`);
+    } finally {
+      setChannelClearing(null);
+      if (step === 3) void refreshAllChannelHealth();
     }
   };
 
@@ -902,6 +990,53 @@ function App() {
     });
   };
 
+  const refreshDiscordHealth = async (gatewayStateHint?: HealthState) => {
+    const hasCred = !!(discordConfig.token?.trim() || discordConfig.botToken?.trim());
+    let tokenState: HealthState = hasCred ? "warn" : "error";
+    let detail = "Discord 需 Bot Token，保存后需 Gateway 运行。";
+    if (hasCred) {
+      try {
+        const cfg = { token: discordConfig.token || discordConfig.botToken, botToken: discordConfig.botToken || discordConfig.token };
+        await invoke<string>("test_channel_connection", { channel: "discord", config: cfg });
+        tokenState = "ok";
+      } catch (e) {
+        tokenState = "error";
+        detail = `Discord 检测：${String(e)}`;
+      }
+    }
+    const gatewayState = gatewayStateHint ?? (await getGatewayHealthState());
+    setDiscordHealth({
+      configured: hasCred ? "ok" : "error",
+      token: tokenState,
+      gateway: gatewayState,
+      pairing: "ok",
+      detail,
+    });
+  };
+
+  const refreshDingtalkHealth = async (gatewayStateHint?: HealthState) => {
+    const hasCred = !!dingtalkConfig.appKey?.trim() && !!dingtalkConfig.appSecret?.trim();
+    let tokenState: HealthState = hasCred ? "warn" : "error";
+    let detail = "钉钉需 AppKey + AppSecret，保存后需 Gateway 运行。";
+    if (hasCred) {
+      try {
+        await invoke<string>("test_channel_connection", { channel: "dingtalk", config: dingtalkConfig });
+        tokenState = "ok";
+      } catch (e) {
+        tokenState = "error";
+        detail = `钉钉检测：${String(e)}`;
+      }
+    }
+    const gatewayState = gatewayStateHint ?? (await getGatewayHealthState());
+    setDingtalkHealth({
+      configured: hasCred ? "ok" : "error",
+      token: tokenState,
+      gateway: gatewayState,
+      pairing: "ok",
+      detail,
+    });
+  };
+
   const refreshAllChannelHealth = async () => {
     if (starting) return;
     const gatewayState = await getGatewayHealthState();
@@ -909,6 +1044,8 @@ function App() {
       refreshTelegramHealth(gatewayState),
       refreshFeishuHealth(gatewayState),
       refreshQqHealth(gatewayState),
+      refreshDiscordHealth(gatewayState),
+      refreshDingtalkHealth(gatewayState),
     ]);
   };
 
@@ -922,7 +1059,7 @@ function App() {
     return () => window.clearInterval(timer);
   }, [step, customConfigPath, starting, autoRefreshHealth]);
 
-  const handleFix = async (type: "node" | "npm" | "openclaw") => {
+  const handleFix = async (type: "node" | "npm" | "git" | "openclaw") => {
     setFixing(type);
     setFixResult(null);
     try {
@@ -934,6 +1071,10 @@ function App() {
         const result = await invoke<string>("fix_npm");
         setFixResult(result);
         await runEnvCheck();
+      } else if (type === "git") {
+        const url = await invoke<string>("fix_git");
+        await openUrl(url);
+        setFixResult("已打开 Git 下载页面，安装后重新检测。若安装失败并提示 spawn git，请先安装 Git。");
       } else {
         setStep(1);
         setFixResult("请在下一步「安装 OpenClaw」页面执行安装。");
@@ -962,6 +1103,19 @@ function App() {
       if (step === 3) {
         void refreshAllChannelHealth();
       }
+    }
+  };
+
+  const handleStartForeground = async () => {
+    const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+    try {
+      const result = await invoke<string>("start_gateway_foreground", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+        installHint,
+      });
+      setStartResult(stripAnsi(result));
+    } catch (e) {
+      setStartResult(stripAnsi(`前台启动失败: ${e}`));
     }
   };
 
@@ -1052,6 +1206,13 @@ function App() {
                   fixing={fixing}
                 />
                 <EnvItem
+                  result={gitCheck!}
+                  type="git"
+                  onFix={handleFix}
+                  fixing={fixing}
+                  warnOnly
+                />
+                <EnvItem
                   result={openclawCheck!}
                   type="openclaw"
                   onFix={handleFix}
@@ -1075,6 +1236,49 @@ function App() {
                     nodejs.org <ExternalLink className="w-3 h-3" />
                   </button>
                 </p>
+              </div>
+            )}
+            {openclawCheck?.ok && npmPathInPath === false && npmPath && (
+              <div className="bg-amber-900/30 border border-amber-700 rounded-lg p-4 space-y-3">
+                <p className="text-amber-200 text-sm">
+                  <strong>PATH 未配置：</strong>
+                  <code className="ml-1 text-amber-100">{npmPath}</code> 未加入系统 PATH，
+                  在 CMD 中可能无法直接运行 <code>openclaw</code> 命令。
+                </p>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={async () => {
+                      setAddingPath(true);
+                      setPathAddResult(null);
+                      try {
+                        const msg = await invoke<string>("add_npm_to_path");
+                        setPathAddResult(msg);
+                        setNpmPathInPath(true);
+                      } catch (e) {
+                        setPathAddResult(`添加失败: ${e}`);
+                      } finally {
+                        setAddingPath(false);
+                      }
+                    }}
+                    disabled={addingPath}
+                    className="flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-500 disabled:opacity-50 rounded-lg text-sm font-medium"
+                  >
+                    {addingPath ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        添加中...
+                      </>
+                    ) : (
+                      <>
+                        <Key className="w-4 h-4" />
+                        一键添加 PATH
+                      </>
+                    )}
+                  </button>
+                </div>
+                {pathAddResult && (
+                  <p className="text-emerald-200 text-sm">{pathAddResult}</p>
+                )}
               </div>
             )}
             <button
@@ -1118,6 +1322,11 @@ function App() {
               </div>
             ) : (
               <>
+                {!envReady && (
+                  <div className="bg-amber-900/30 border border-amber-700 rounded-lg p-3 text-amber-200 text-sm">
+                    请先在「环境检测」页面安装 Node.js 和 npm；若已安装，请从开始菜单重新打开本应用。
+                  </div>
+                )}
                 <p className="text-slate-400">默认安装到：{recommendedInstallDir || "C:/Users/你的账号/openclaw"}</p>
                 <button
                   onClick={handleInstallDefault}
@@ -1475,6 +1684,13 @@ function App() {
               {dashboardOpening ? <Loader2 className="w-5 h-5 animate-spin" /> : <ExternalLink className="w-5 h-5" />}
               {dashboardOpening ? "打开中..." : "一键打开 OpenClaw 对话界面"}
             </button>
+            <button
+              onClick={handleStartForeground}
+              className="flex items-center gap-2 px-6 py-3 bg-slate-700 hover:bg-slate-600 rounded-lg font-medium text-sm"
+            >
+              <Wrench className="w-5 h-5" />
+              前台启动 Gateway（计划任务失败时用）
+            </button>
             {startResult && (
               <pre className="bg-slate-800 rounded-lg p-4 text-sm overflow-auto max-h-40">
                 {startResult}
@@ -1563,6 +1779,24 @@ function App() {
                   <p className="text-slate-500">截图位：QQ 开放平台凭证页</p>
                 </div>
               </details>
+              <details className="bg-slate-900/40 rounded p-3">
+                <summary className="cursor-pointer text-slate-200">Discord（第 1/2/3 步）</summary>
+                <div className="mt-2 text-slate-300 space-y-1">
+                  <p>1) 打开 Discord 开发者门户创建应用</p>
+                  <p>2) 在 Bot 页面创建 Bot 并复制 Token</p>
+                  <p>3) 在本页 Discord 卡片填写 Token 并保存</p>
+                  <p className="text-slate-500">需安装 @openclaw/discord 插件（非内置）</p>
+                </div>
+              </details>
+              <details className="bg-slate-900/40 rounded p-3">
+                <summary className="cursor-pointer text-slate-200">钉钉（第 1/2/3 步）</summary>
+                <div className="mt-2 text-slate-300 space-y-1">
+                  <p>1) 打开钉钉开放平台创建应用</p>
+                  <p>2) 获取 AppKey 和 AppSecret</p>
+                  <p>3) 在本页钉钉卡片填写并保存</p>
+                  <p className="text-slate-500">需安装 @adongguo/openclaw-dingtalk 插件</p>
+                </div>
+              </details>
                 <div className="flex flex-wrap gap-2 pt-1">
                   <button
                     onClick={() => openUrl("https://core.telegram.org/bots#6-botfather")}
@@ -1582,12 +1816,28 @@ function App() {
                   >
                     打开 QQ 开放平台
                   </button>
+                  <button
+                    onClick={() => openUrl("https://discord.com/developers/applications")}
+                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                  >
+                    打开 Discord 开发者门户
+                  </button>
+                  <button
+                    onClick={() => openUrl("https://open.dingtalk.com/")}
+                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                  >
+                    打开钉钉开放平台
+                  </button>
                 </div>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                 <ChannelCard
                   title="Telegram"
-                  children={
+                  channelId="telegram"
+                  configured={channelConfigStatus.telegram}
+                  onClear={() => handleClearChannel("telegram")}
+                  clearing={channelClearing === "telegram"}
+                >
                     <>
                       <input
                         type="text"
@@ -1652,12 +1902,15 @@ function App() {
                         </div>
                       </div>
                     </>
-                  }
-                />
+                </ChannelCard>
                 <ChannelCard
                   title="飞书"
-                  children={
-                    <>
+                  channelId="feishu"
+                  configured={channelConfigStatus.feishu}
+                  onClear={() => handleClearChannel("feishu")}
+                  clearing={channelClearing === "feishu"}
+                >
+                  <>
                       <input
                         type="text"
                         placeholder="App ID"
@@ -1701,12 +1954,15 @@ function App() {
                       </div>
                       <p className="text-xs text-slate-500 mt-1">{feishuHealth.detail}</p>
                     </>
-                  }
-                />
+                </ChannelCard>
                 <ChannelCard
                   title="QQ"
-                  children={
-                    <>
+                  channelId="qq"
+                  configured={channelConfigStatus.qq}
+                  onClear={() => handleClearChannel("qq")}
+                  clearing={channelClearing === "qq"}
+                >
+                  <>
                       <input
                         type="text"
                         placeholder="App ID"
@@ -1746,8 +2002,95 @@ function App() {
                       </div>
                       <p className="text-xs text-slate-500 mt-1">{qqHealth.detail}</p>
                     </>
-                  }
-                />
+                </ChannelCard>
+                <ChannelCard
+                  title="Discord"
+                  channelId="discord"
+                  configured={channelConfigStatus.discord}
+                  onClear={() => handleClearChannel("discord")}
+                  clearing={channelClearing === "discord"}
+                >
+                  <>
+                    <input
+                      type="password"
+                      placeholder="Bot Token"
+                      value={discordConfig.token ?? discordConfig.botToken ?? ""}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setDiscordConfig((p) => ({ ...p, token: v, botToken: v }));
+                      }}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
+                    />
+                    <div className="flex gap-2 mt-2">
+                      <button
+                        onClick={() => handleSaveChannel("discord", { token: discordConfig.token || discordConfig.botToken, botToken: discordConfig.botToken || discordConfig.token })}
+                        disabled={channelSaving === "discord"}
+                        className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-xs"
+                      >
+                        保存
+                      </button>
+                      <button
+                        onClick={() => handleTestChannel("discord", { token: discordConfig.token || discordConfig.botToken, botToken: discordConfig.botToken || discordConfig.token })}
+                        disabled={channelTesting === "discord"}
+                        className="px-3 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-xs"
+                      >
+                        连通性测试
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 mt-2">
+                      <HealthLamp label="已配置" state={discordHealth.configured} />
+                      <HealthLamp label="凭证连通" state={discordHealth.token} />
+                      <HealthLamp label="Gateway" state={discordHealth.gateway} />
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1">{discordHealth.detail}</p>
+                  </>
+                </ChannelCard>
+                <ChannelCard
+                  title="钉钉"
+                  channelId="dingtalk"
+                  configured={channelConfigStatus.dingtalk}
+                  onClear={() => handleClearChannel("dingtalk")}
+                  clearing={channelClearing === "dingtalk"}
+                >
+                  <>
+                    <input
+                      type="text"
+                      placeholder="AppKey"
+                      value={dingtalkConfig.appKey ?? ""}
+                      onChange={(e) => setDingtalkConfig((p) => ({ ...p, appKey: e.target.value }))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
+                    />
+                    <input
+                      type="password"
+                      placeholder="AppSecret"
+                      value={dingtalkConfig.appSecret ?? ""}
+                      onChange={(e) => setDingtalkConfig((p) => ({ ...p, appSecret: e.target.value }))}
+                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm mt-2"
+                    />
+                    <div className="flex gap-2 mt-2">
+                      <button
+                        onClick={() => handleSaveChannel("dingtalk", dingtalkConfig)}
+                        disabled={channelSaving === "dingtalk"}
+                        className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-xs"
+                      >
+                        保存
+                      </button>
+                      <button
+                        onClick={() => handleTestChannel("dingtalk", dingtalkConfig)}
+                        disabled={channelTesting === "dingtalk"}
+                        className="px-3 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-xs"
+                      >
+                        连通性测试
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 mt-2">
+                      <HealthLamp label="已配置" state={dingtalkHealth.configured} />
+                      <HealthLamp label="凭证连通" state={dingtalkHealth.token} />
+                      <HealthLamp label="Gateway" state={dingtalkHealth.gateway} />
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1">{dingtalkHealth.detail}</p>
+                  </>
+                </ChannelCard>
               </div>
               {channelResult && (
                 <pre className="bg-slate-800 rounded-lg p-3 text-sm overflow-auto max-h-32">
@@ -1758,7 +2101,7 @@ function App() {
             <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-2">
               <p className="font-medium text-slate-200">后续如何交互（推荐顺序）</p>
               <p>1) 先点「启动 Gateway」，若提示服务缺失会自动安装并重试。</p>
-              <p>2) 直接在图形化卡片配置 Telegram / 飞书 / QQ，并先做连通性测试。</p>
+              <p>2) 直接在图形化卡片配置 Telegram / 飞书 / QQ / Discord / 钉钉，并先做连通性测试。</p>
               <p>3) 配好后，在对应聊天应用里给机器人发消息即可对话。</p>
               <p className="text-slate-400">
                 说明：敏感信息不会在页面回显，避免泄露；请妥善保存凭证。
@@ -1804,11 +2147,39 @@ function App() {
   );
 }
 
-function ChannelCard({ title, children }: { title: string; children: React.ReactNode }) {
+function ChannelCard({
+  title,
+  channelId,
+  configured,
+  onClear,
+  clearing,
+  children,
+}: {
+  title: string;
+  channelId?: "telegram" | "feishu" | "qq" | "discord" | "dingtalk";
+  configured?: boolean;
+  onClear?: () => void;
+  clearing?: boolean;
+  children: React.ReactNode;
+}) {
   return (
     <div className="bg-slate-800/60 rounded-lg p-3 border border-slate-700">
-      <p className="text-slate-200 font-medium mb-2">{title}</p>
+      <div className="flex items-center justify-between mb-2">
+        <p className="text-slate-200 font-medium">{title}</p>
+        {configured && (
+          <span className="text-xs text-emerald-400 font-medium">已配置</span>
+        )}
+      </div>
       {children}
+      {configured && channelId && onClear && (
+        <button
+          onClick={onClear}
+          disabled={clearing}
+          className="mt-2 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs text-slate-300"
+        >
+          {clearing ? "清除中…" : "清除配置"}
+        </button>
+      )}
     </div>
   );
 }
@@ -1838,28 +2209,35 @@ function EnvItem({
   type,
   onFix,
   fixing,
+  warnOnly,
 }: {
   result: EnvCheckResult;
-  type: "node" | "npm" | "openclaw";
-  onFix: (type: "node" | "npm" | "openclaw") => void;
-  fixing: "node" | "npm" | "openclaw" | null;
+  type: "node" | "npm" | "git" | "openclaw";
+  onFix: (type: "node" | "npm" | "git" | "openclaw") => void;
+  fixing: "node" | "npm" | "git" | "openclaw" | null;
+  warnOnly?: boolean;
 }) {
-  const fixLabel = type === "openclaw" ? "去安装页" : "修复";
+  const fixLabel = type === "openclaw" ? "去安装页" : type === "git" ? "安装" : "修复";
   const isFixing = fixing === type;
+  const isWarn = warnOnly && !result.ok;
 
   return (
     <div
       className={`flex items-start gap-3 p-4 rounded-lg border ${
-        result.ok ? "bg-emerald-900/20 border-emerald-800" : "bg-red-900/20 border-red-800"
+        result.ok
+          ? "bg-emerald-900/20 border-emerald-800"
+          : isWarn
+            ? "bg-amber-900/20 border-amber-800"
+            : "bg-red-900/20 border-red-800"
       }`}
     >
       {result.ok ? (
         <CheckCircle2 className="w-6 h-6 text-emerald-500 flex-shrink-0 mt-0.5" />
       ) : (
-        <XCircle className="w-6 h-6 text-red-500 flex-shrink-0 mt-0.5" />
+        <XCircle className={`w-6 h-6 flex-shrink-0 mt-0.5 ${isWarn ? "text-amber-500" : "text-red-500"}`} />
       )}
       <div className="flex-1 min-w-0">
-        <p className={result.ok ? "text-emerald-200" : "text-red-200"}>{result.message}</p>
+        <p className={result.ok ? "text-emerald-200" : isWarn ? "text-amber-200" : "text-red-200"}>{result.message}</p>
         {result.version && (
           <p className="text-slate-500 text-sm mt-1">版本: {result.version}</p>
         )}

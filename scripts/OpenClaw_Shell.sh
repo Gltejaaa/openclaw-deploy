@@ -26,6 +26,15 @@ FIXED_MODELS=(
 )
 DEFAULT_BASE_URL="https://api.siliconflow.cn/v1"
 
+# 交互式读取（curl 管道运行时 stdin 是管道，需从 /dev/tty 读）
+read_input() {
+  if [[ -e /dev/tty ]]; then
+    read -r "$@" < /dev/tty
+  else
+    read -r "$@"
+  fi
+}
+
 # 查找 openclaw 命令（安装后需刷新 PATH）
 find_openclaw() {
   # 加入常见 npm 全局路径
@@ -186,7 +195,7 @@ quick_config() {
   echo ""
   echo -e "${YELLOW}--- 快速配置（硅基流动）---${NC}"
   echo "填写配置目录完整路径（默认 $HOME/.openclaw）"
-  read -r -p "配置路径 [回车默认]: " custom_path
+  read_input -p "配置路径 [回车默认]: " custom_path
   if [[ -n "$custom_path" ]]; then
     OPENCLAW_CONFIG="${custom_path%/}"
     export OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG"
@@ -202,7 +211,7 @@ quick_config() {
     echo -e "  [$i] $label ($id)"
     ((i++)) || true
   done
-  read -r -p "请选择 (1-${#FIXED_MODELS[@]}，默认1): " sel
+  read_input -p "请选择 (1-${#FIXED_MODELS[@]}，默认1): " sel
   sel="${sel:-1}"
   local model_id
   if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#FIXED_MODELS[@]} )); then
@@ -213,7 +222,7 @@ quick_config() {
   echo -e "${CYAN}想用更多高端模型？加群 1088525353 解锁！${NC}"
   echo ""
 
-  read -r -p "API Key (硅基流动): " api_key
+  read_input -p "API Key (硅基流动): " api_key
   if [[ -z "$api_key" ]]; then
     echo -e "${YELLOW}[取消] 未输入 API Key${NC}"
     return
@@ -251,13 +260,13 @@ main() {
   esac
 
   if ! ensure_openclaw; then
-    read -r -p "按回车退出"
+    read_input -p "按回车退出"
     exit 1
   fi
 
   while true; do
     show_header
-    read -r -p "请选择: " choice
+    read_input -p "请选择: " choice
     choice="${choice:-}"
 
     case "$choice" in
@@ -292,7 +301,7 @@ main() {
         echo ""
         echo -e "${YELLOW}--- 常用命令 ---${NC}"
         echo "  [1] status   [2] gateway status   [3] doctor"
-        read -r -p "选择: " sub
+        read_input -p "选择: " sub
         case "$sub" in
           1) run_openclaw status ;;
           2) run_openclaw gateway status ;;
@@ -311,7 +320,7 @@ main() {
         echo ""
         echo -e "${YELLOW}当前配置路径: $OPENCLAW_CONFIG${NC}"
         echo "设置自定义路径（export OPENCLAW_STATE_DIR=路径）"
-        read -r -p "新路径 (留空取消): " new_path
+        read_input -p "新路径 (留空取消): " new_path
         if [[ -n "$new_path" ]]; then
           OPENCLAW_CONFIG="${new_path%/}"
           echo "当前会话已切换，持久化请加入 ~/.bashrc 或 ~/.zshrc:"
@@ -322,7 +331,7 @@ main() {
       *) echo -e "${YELLOW}无效输入${NC}" ;;
     esac
     echo ""
-    read -r -p "按回车继续"
+    read_input -p "按回车继续"
   done
 }
 

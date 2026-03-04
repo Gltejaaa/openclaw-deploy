@@ -26,21 +26,36 @@ FIXED_MODELS=(
 )
 DEFAULT_BASE_URL="https://api.siliconflow.cn/v1"
 
-# 查找 openclaw 命令
+# 查找 openclaw 命令（安装后需刷新 PATH）
 find_openclaw() {
-  export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+  # 加入常见 npm 全局路径
+  local npm_prefix
+  npm_prefix=$(npm config get prefix 2>/dev/null || true)
+  npm_prefix="${npm_prefix%/}"
+  [[ -n "$npm_prefix" ]] && export PATH="$npm_prefix/bin:$PATH"
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+  hash -r 2>/dev/null || true
+
   if command -v openclaw &>/dev/null; then
     echo "openclaw"
     return
   fi
-  local npm_global="$HOME/.local/bin"
-  [[ -x "$npm_global/openclaw" ]] && { echo "$npm_global/openclaw"; return; }
-  local prefix
-  prefix=$(npm config get prefix 2>/dev/null || true)
-  prefix="${prefix%/}"
-  [[ -n "$prefix" && -x "$prefix/bin/openclaw" ]] && { echo "$prefix/bin/openclaw"; return; }
+  [[ -x "$HOME/.local/bin/openclaw" ]] && { echo "$HOME/.local/bin/openclaw"; return; }
+  [[ -n "$npm_prefix" && -x "$npm_prefix/bin/openclaw" ]] && { echo "$npm_prefix/bin/openclaw"; return; }
+  # npm root -g 的 ../bin
+  local npm_root
+  npm_root=$(npm root -g 2>/dev/null || true)
+  if [[ -n "$npm_root" && -x "$npm_root/../bin/openclaw" ]]; then
+    echo "$npm_root/../bin/openclaw"
+    return
+  fi
   [[ -x "/usr/local/bin/openclaw" ]] && { echo "/usr/local/bin/openclaw"; return; }
   [[ -x "/opt/homebrew/bin/openclaw" ]] && { echo "/opt/homebrew/bin/openclaw"; return; }
+  # 最后尝试 npx（可运行刚安装的包）
+  if command -v npx &>/dev/null; then
+    echo "npx openclaw"
+    return
+  fi
   echo ""
 }
 
@@ -59,7 +74,7 @@ gateway_running() {
 start_gateway() {
   export OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG"
   mkdir -p "$OPENCLAW_CONFIG"
-  nohup $OPENCLAW_CMD gateway --port 18789 >> "$OPENCLAW_CONFIG/gateway.log" 2>&1 &
+  nohup env OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG" $OPENCLAW_CMD gateway --port 18789 >> "$OPENCLAW_CONFIG/gateway.log" 2>&1 &
   echo $! > "$OPENCLAW_CONFIG/gateway.pid" 2>/dev/null || true
 }
 
@@ -116,7 +131,17 @@ ensure_openclaw() {
   if [[ -z "$OPENCLAW_CMD" ]]; then
     echo -e "${YELLOW}未检测到 OpenClaw，正在安装...${NC}"
     if npm install -g openclaw 2>/dev/null; then
+      # 安装后刷新 PATH 再查找
       OPENCLAW_CMD=$(find_openclaw)
+    fi
+    if [[ -z "$OPENCLAW_CMD" ]]; then
+      # 尝试无 sudo 安装到用户目录
+      echo -e "${YELLOW}全局安装未找到，尝试用户目录安装...${NC}"
+      npm config set prefix "$HOME/.local" 2>/dev/null || true
+      if npm install -g openclaw 2>/dev/null; then
+        export PATH="$HOME/.local/bin:$PATH"
+        OPENCLAW_CMD=$(find_openclaw)
+      fi
     fi
   fi
   if [[ -z "$OPENCLAW_CMD" ]]; then

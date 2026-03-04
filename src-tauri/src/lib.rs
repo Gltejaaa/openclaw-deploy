@@ -861,6 +861,56 @@ fn resolve_openclaw_dir(custom_path: Option<&str>) -> String {
         })
 }
 
+/// 自动检测当前 OpenClaw 配置路径（用于填充「自定义配置路径」）
+#[tauri::command]
+fn detect_openclaw_config_path() -> Result<Option<String>, String> {
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let home_slash = home.replace('\\', "/");
+    let default_dir = format!("{}/.openclaw", home_slash);
+    let nested_dir = format!("{}/openclaw/.openclaw", home_slash);
+
+    let candidates: Vec<String> = vec![default_dir.clone(), nested_dir.clone()];
+
+    // 1. 优先从 gateway.cmd 读取 OPENCLAW_STATE_DIR（Gateway 实际使用的路径）
+    for base in [&default_dir, &nested_dir] {
+        let gateway_path = format!("{}/gateway.cmd", base.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Ok(content) = std::fs::read_to_string(&gateway_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                let up = line.to_uppercase();
+                if (up.starts_with("SET ") || up.starts_with("SET\t")) && up.contains("OPENCLAW_STATE_DIR") {
+                    if let Some(eq) = line.find('=') {
+                        let val = line[eq + 1..].trim().trim_matches('"').trim();
+                        if !val.is_empty() {
+                            let normalized = val.replace('\\', "/");
+                            let cfg = format!("{}/openclaw.json", normalized);
+                            if Path::new(&cfg).exists() {
+                                return Ok(Some(normalized));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 按优先级返回存在 openclaw.json 的目录
+    for dir in &candidates {
+        let cfg_path = format!("{}/openclaw.json", dir.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if Path::new(&cfg_path).exists() {
+            if let Ok(txt) = std::fs::read_to_string(&cfg_path) {
+                if serde_json::from_str::<Value>(&txt).is_ok() {
+                    return Ok(Some(dir.replace('\\', "/")));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 fn load_openclaw_config(openclaw_dir: &str) -> Result<Value, String> {
     let config_path = format!("{}/openclaw.json", openclaw_dir.replace('\\', "/"));
     if !Path::new(&config_path).exists() {
@@ -877,6 +927,86 @@ fn save_openclaw_config(openclaw_dir: &str, root: &Value) -> Result<(), String> 
         serde_json::to_string_pretty(root).map_err(|e| format!("序列化配置失败: {}", e))?,
     )
     .map_err(|e| format!("写入 openclaw.json 失败: {}", e))
+}
+
+/// 在 gateway.cmd 中注入 OPENCLAW_STATE_DIR，确保计划任务启动的 Gateway 使用用户配置目录
+#[tauri::command]
+fn check_config_path_consistency(custom_path: Option<String>) -> Result<serde_json::Value, String> {
+    let default_dir = resolve_openclaw_dir(None);
+    let client_dir = custom_path
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_dir.clone());
+    let gateway_cmd_default = format!("{}/gateway.cmd", default_dir.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let gateway_cmd_client = format!("{}/gateway.cmd", client_dir.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let has_openclaw_default = Path::new(&format!("{}/openclaw.json", default_dir)).exists();
+    let has_openclaw_client = Path::new(&format!("{}/openclaw.json", client_dir)).exists();
+    let gateway_has_state_dir = Path::new(&gateway_cmd_default)
+        .exists()
+        .then(|| {
+            std::fs::read_to_string(&gateway_cmd_default)
+                .map(|c| c.contains("OPENCLAW_STATE_DIR"))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let primary_default = load_openclaw_config(&default_dir)
+        .ok()
+        .and_then(|c| c.get("agents").and_then(|a| a.get("defaults")).and_then(|d| d.get("model")).and_then(|m| m.get("primary")).and_then(|p| p.as_str().map(String::from)))
+        .unwrap_or_else(|| "(未设置)".to_string());
+    let primary_client = load_openclaw_config(&client_dir)
+        .ok()
+        .and_then(|c| c.get("agents").and_then(|a| a.get("defaults")).and_then(|d| d.get("model")).and_then(|m| m.get("primary")).and_then(|p| p.as_str().map(String::from)))
+        .unwrap_or_else(|| "(未设置)".to_string());
+    let consistent = client_dir == default_dir || (Path::new(&gateway_cmd_client).exists() && has_openclaw_client);
+    Ok(json!({
+        "clientDir": client_dir,
+        "defaultDir": default_dir,
+        "consistent": consistent,
+        "hasOpenclawDefault": has_openclaw_default,
+        "hasOpenclawClient": has_openclaw_client,
+        "gatewayHasStateDir": gateway_has_state_dir,
+        "primaryDefault": primary_default,
+        "primaryClient": primary_client,
+        "suggestion": if !consistent && has_openclaw_client && has_openclaw_default && primary_default != primary_client {
+            "检测到部署工具与 Gateway 使用不同配置目录，模型不一致。请清空「自定义配置路径」使用默认 ~/.openclaw，或重新点击「启动 Gateway」以同步。"
+        } else if !consistent {
+            "建议清空「自定义配置路径」使用默认目录，或确保启动 Gateway 时使用相同路径。"
+        } else {
+            ""
+        }
+    }))
+}
+
+/// 在 gateway.cmd 中注入 OPENCLAW_STATE_DIR，确保计划任务启动的 Gateway 使用用户配置目录
+/// 同时 patch 默认 ~/.openclaw 下的 gateway.cmd（OpenClaw 可能总在此创建），使其指向用户路径
+fn patch_gateway_cmd_state_dir(state_dir: &str) {
+    let state_dir_win = state_dir.replace('/', "\\");
+    let inject = format!("set \"OPENCLAW_STATE_DIR={}\"\r\n", state_dir_win);
+    let default_dir = resolve_openclaw_dir(None);
+    let paths_to_patch: Vec<String> = if state_dir != default_dir {
+        vec![
+            format!("{}/gateway.cmd", state_dir.replace('/', std::path::MAIN_SEPARATOR_STR)),
+            format!("{}/gateway.cmd", default_dir.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        ]
+    } else {
+        vec![format!("{}/gateway.cmd", state_dir.replace('/', std::path::MAIN_SEPARATOR_STR))]
+    };
+    for gateway_path in paths_to_patch {
+        let path = Path::new(&gateway_path);
+        if !path.exists() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&gateway_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if content.contains("OPENCLAW_STATE_DIR") {
+            continue; // 已包含，跳过
+        }
+        let new_content = inject.clone() + &content;
+        let _ = std::fs::write(&gateway_path, new_content);
+    }
 }
 
 fn ensure_gateway_mode_local(root: &mut Value) {
@@ -975,9 +1105,13 @@ fn normalize_openclaw_config_for_models(root: &mut Value) {
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.openai.com/v1")
         .to_ascii_lowercase();
+    // 硅基、国产模型等使用 /chat/completions，需 openai-completions；openai-responses 用 /responses 会 404
     let default_api = if base_url_text.contains("moonshot.cn")
         || base_url_text.contains("moonshot.ai")
         || base_url_text.contains("dashscope.aliyuncs.com")
+        || base_url_text.contains("siliconflow.cn")
+        || base_url_text.contains("siliconflow.com")
+        || base_url_text.contains("deepseek.com")
     {
         "openai-completions"
     } else {
@@ -1017,10 +1151,13 @@ fn primary_prefix_for_provider(provider: &str) -> &'static str {
 
 fn normalize_primary_model(provider: &str, selected_model: Option<&str>) -> String {
     if let Some(raw) = selected_model.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        if raw.contains('/') {
+        let prefix = primary_prefix_for_provider(provider);
+        // 已带正确 provider 前缀则直接返回
+        if raw.to_lowercase().starts_with(&format!("{}/", prefix.to_lowercase())) {
             return raw.to_string();
         }
-        return format!("{}/{}", primary_prefix_for_provider(provider), raw);
+        // 硅基等返回 "deepseek-ai/DeepSeek-V3" 或 "Pro/xxx"，需加 openai 前缀，否则 Unknown model
+        return format!("{}/{}", prefix, raw);
     }
     preferred_primary_model_for_provider(provider).to_string()
 }
@@ -1203,6 +1340,9 @@ fn sync_models_cache_api_key(
         || base_lower.contains("moonshot.cn")
         || base_lower.contains("moonshot.ai")
         || base_lower.contains("dashscope.aliyuncs.com")
+        || base_lower.contains("siliconflow.cn")
+        || base_lower.contains("siliconflow.com")
+        || base_lower.contains("deepseek.com")
     {
         "openai-completions"
     } else {
@@ -1217,6 +1357,18 @@ fn sync_models_cache_api_key(
             "models": []
         }),
     );
+    // 保存硅基/非 Kimi 时移除 custom-api-moonshot 残留，避免 OpenClaw 仍用 kimi-k2.5
+    let is_moonshot = base_lower.contains("moonshot.cn") || base_lower.contains("moonshot.ai");
+    if !is_moonshot {
+        let custom_keys: Vec<String> = providers_obj
+            .keys()
+            .filter(|k| k.starts_with("custom-api-"))
+            .cloned()
+            .collect();
+        for k in custom_keys {
+            providers_obj.remove(&k);
+        }
+    }
     // 修复历史 custom provider 残留（如 custom-api-moonshot-cn）导致继续读旧 key
     for (_id, pval) in providers_obj.iter_mut() {
         let Some(pobj) = pval.as_object_mut() else { continue };
@@ -1612,9 +1764,14 @@ fn write_env_config(
         }
         let openai_obj = openai.as_object_mut().expect("openai object");
         openai_obj.insert("apiKey".to_string(), json!(effective_api_key));
-        let desired_api = match provider.as_str() {
-            "kimi" | "moonshot" | "qwen" | "bailian" | "dashscope" => "openai-completions",
-            _ => "openai-responses",
+        let base_lower = base_url.as_ref().map(|u| u.to_ascii_lowercase()).unwrap_or_default();
+        let desired_api = if provider == "kimi" || provider == "moonshot" || provider == "qwen"
+            || provider == "bailian" || provider == "dashscope"
+            || base_lower.contains("siliconflow") || base_lower.contains("deepseek.com")
+        {
+            "openai-completions"
+        } else {
+            "openai-responses"
         };
         openai_obj.insert("api".to_string(), json!(desired_api));
         if let Some(u) = base_url.clone().filter(|s| !s.trim().is_empty()) {
@@ -2074,13 +2231,30 @@ fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> R
     }
     let env_extra = state_dir.as_ref().map(|s| ("OPENCLAW_STATE_DIR", s.as_str()));
 
+    // 启动前强制用当前配置路径重装 gateway 任务，确保计划任务执行的是用户配置目录下的 gateway.cmd
+    // 否则 Gateway 会读 ~/.openclaw 而部署工具可能写入自定义路径，导致模型/Key 不一致
+    let _ = run_openclaw_cmd_clean(&exe, &["gateway", "install", "--force"], env_extra);
+    if let Some(ref dir) = state_dir {
+        patch_gateway_cmd_state_dir(dir);
+    }
+    std::thread::sleep(Duration::from_secs(1));
+
     // 启动前清理旧进程，避免端口被占用
     let _ = run_openclaw_cmd_clean(&exe, &["gateway", "stop"], env_extra);
     std::thread::sleep(Duration::from_secs(2));
 
     let (ok, stdout, stderr) = run_openclaw_cmd_clean(&exe, &["gateway", "start"], env_extra)?;
     if ok {
-        return Ok(format!("Gateway 已启动\n{}", stdout));
+        // 启动后延迟探活，避免 Telegram 等渠道“无响应”
+        std::thread::sleep(Duration::from_secs(5));
+        let (_, status_out, _) = run_openclaw_cmd_clean(&exe, &["gateway", "status"], env_extra).unwrap_or((false, String::new(), String::new()));
+        let status_lower = status_out.to_lowercase();
+        let rpc_ok = !status_lower.contains("rpc probe") || !status_lower.contains("failed");
+        let mut msg = format!("Gateway 已启动\n{}", stdout);
+        if !rpc_ok {
+            msg.push_str("\n\n⚠️ 探活未通过，Telegram/对话可能无响应。建议：\n1. 清空「自定义配置路径」使用默认 ~/.openclaw\n2. 点击「前台启动 Gateway」重试\n3. 或 CMD 执行 openclaw gateway 保持窗口不关");
+        }
+        return Ok(msg);
     }
 
     let combined = format!("{}\n{}", stdout, stderr);
@@ -2090,6 +2264,13 @@ fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> R
         || lower.contains("already started")
         || lower.contains("已在运行")
     {
+        // 已在运行也做一次探活，若失败则提示
+        std::thread::sleep(Duration::from_secs(2));
+        let (_, status_out, _) = run_openclaw_cmd_clean(&exe, &["gateway", "status"], env_extra).unwrap_or((false, String::new(), String::new()));
+        let status_lower = status_out.to_lowercase();
+        if status_lower.contains("rpc probe") && status_lower.contains("failed") {
+            return Ok("Gateway 任务已存在，但探活失败（Telegram 可能无响应）。建议：清空「自定义配置路径」后重新点击「启动 Gateway」，或使用「前台启动 Gateway」。".to_string());
+        }
         return Ok("Gateway 已在运行".to_string());
     }
     let diag = format!(
@@ -2731,12 +2912,18 @@ fn test_model_connection(
                 format!(r#"@{{"x-api-key"="{}";"anthropic-version"="2023-06-01";"Content-Type"="application/json"}}"#, key),
             )
         } else {
-            let probe_model = match provider.as_str() {
-                "kimi" | "moonshot" => "moonshot-v1-32k",
-                "qwen" | "bailian" | "dashscope" => "qwen-plus",
-                "deepseek" => "deepseek-chat",
-                "openai" => "gpt-4o-mini",
-                _ => "gpt-4o-mini",
+            // 硅基流动等中转使用不同模型 ID，需用 deepseek-ai/DeepSeek-V3 等
+            let base_lower = resolved_base.to_lowercase();
+            let probe_model = if base_lower.contains("siliconflow") {
+                "deepseek-ai/DeepSeek-V3"
+            } else {
+                match provider.as_str() {
+                    "kimi" | "moonshot" => "moonshot-v1-32k",
+                    "qwen" | "bailian" | "dashscope" => "qwen-plus",
+                    "deepseek" => "deepseek-chat",
+                    "openai" => "gpt-4o-mini",
+                    _ => "gpt-4o-mini",
+                }
             };
             (
                 format!("{}/chat/completions", resolved_base.trim_end_matches('/')),
@@ -3373,6 +3560,8 @@ pub fn run() {
             fix_openclaw,
             check_npm_path_in_user_env,
             add_npm_to_path,
+            check_config_path_consistency,
+            detect_openclaw_config_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

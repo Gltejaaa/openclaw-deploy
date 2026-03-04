@@ -1,4 +1,4 @@
-# OpenClaw Shell - UTF-8 with BOM
+﻿# OpenClaw Shell - UTF-8 with BOM
 param(
   [string]$Action = ""
 )
@@ -59,10 +59,31 @@ if (-not $hasNode -or -not $hasGit) {
   exit 1
 }
 
-# 配置路径：优先环境变量 OPENCLAW_CONFIG / OPENCLAW_CONFIG_DIR，否则默认 ~/.openclaw
-$OPENCLAW_CONFIG = if ($env:OPENCLAW_CONFIG) { $env:OPENCLAW_CONFIG.Trim().TrimEnd([char]92) }
-  elseif ($env:OPENCLAW_CONFIG_DIR) { $env:OPENCLAW_CONFIG_DIR.Trim().TrimEnd([char]92) }
-  else { "$env:USERPROFILE\.openclaw" }
+# 配置路径：优先 OPENCLAW_STATE_DIR（与 OpenClaw 官方一致），其次 OPENCLAW_CONFIG / OPENCLAW_CONFIG_DIR，否则默认 ~/.openclaw
+# 未设置时尝试从 gateway.cmd 自动检测（解决安装在其他盘时路径不一致）
+function Get-DefaultOpenClawConfig {
+  if ($env:OPENCLAW_STATE_DIR) { return $env:OPENCLAW_STATE_DIR.Trim().TrimEnd([char]92) }
+  if ($env:OPENCLAW_CONFIG) { return $env:OPENCLAW_CONFIG.Trim().TrimEnd([char]92) }
+  if ($env:OPENCLAW_CONFIG_DIR) { return $env:OPENCLAW_CONFIG_DIR.Trim().TrimEnd([char]92) }
+  $defaultDir = "$env:USERPROFILE\.openclaw"
+  $nestedDir = "$env:USERPROFILE\openclaw\.openclaw"
+  foreach ($base in @($defaultDir, $nestedDir)) {
+    $gwPath = Join-Path $base "gateway.cmd"
+    if (-not (Test-Path $gwPath)) { continue }
+    $content = [System.IO.File]::ReadAllText($gwPath)
+    $detected = $null
+    if ($content -match 'OPENCLAW_STATE_DIR\s*=\s*"([^"]+)"') {
+      $detected = $Matches[1].Trim().TrimEnd([char]92)
+    } elseif ($content -match 'OPENCLAW_STATE_DIR\s*=\s*(\S+)') {
+      $detected = $Matches[1].Trim().TrimEnd([char]92).TrimEnd('"')
+    }
+    if ($detected -and (Test-Path (Join-Path $detected "openclaw.json"))) {
+      return $detected
+    }
+  }
+  return $defaultDir
+}
+$OPENCLAW_CONFIG = Get-DefaultOpenClawConfig
 
 # 优先使用系统 PATH 中实际调用的 openclaw（支持一键部署的自定义安装目录）
 # 注意：必须用 .cmd 而非 .ps1，否则 Start-Process 会打开编辑器而非执行
@@ -291,13 +312,21 @@ function Ensure-OpenClaw {
 
 function Run-OpenClaw {
   param([string]$CmdArgs)
-  if ($CmdArgs) {
-    $parts = $CmdArgs.Trim() -split ' +'
-    & $OPENCLAW_CMD @parts
-  } else {
-    & $OPENCLAW_CMD
+  $cfgDir = Get-OpenClawConfigDir
+  $prevState = $env:OPENCLAW_STATE_DIR
+  try {
+    $env:OPENCLAW_STATE_DIR = $cfgDir
+    if ($CmdArgs) {
+      $parts = $CmdArgs.Trim() -split ' +'
+      & $OPENCLAW_CMD @parts
+    } else {
+      & $OPENCLAW_CMD
+    }
+    return $LASTEXITCODE
+  } finally {
+    if ($null -eq $prevState) { Remove-Item Env:OPENCLAW_STATE_DIR -ErrorAction SilentlyContinue }
+    else { $env:OPENCLAW_STATE_DIR = $prevState }
   }
-  return $LASTEXITCODE
 }
 
 # 确保 gateway.mode 已设置（OpenClaw 2026+ 要求，否则 Gateway 会拒绝启动）
@@ -328,14 +357,31 @@ function Start-Gateway-Hidden {
   try {
     $ocDir = Split-Path $OPENCLAW_CMD -Parent
     if (-not (Test-Path $OPENCLAW_CMD)) { return $false }
-    & $OPENCLAW_CMD gateway install 2>$null | Out-Null
+    $env:OPENCLAW_STATE_DIR = Get-OpenClawConfigDir
+    & $OPENCLAW_CMD gateway install --force 2>$null | Out-Null
+    Patch-GatewayCmdStateDir
     Start-Sleep -Seconds 1
     schtasks /run /tn "OpenClaw Gateway" 2>$null | Out-Null
     return $true
   } catch { return $false }
 }
 
-# 修复 .openclaw/gateway.cmd：当指向已删除路径时，用当前 openclaw 重写
+# 在 gateway.cmd 中注入 OPENCLAW_STATE_DIR，确保计划任务启动的 Gateway 使用正确配置目录
+function Patch-GatewayCmdStateDir {
+  $configDir = Get-OpenClawConfigDir
+  $gwPath = Join-Path $configDir "gateway.cmd"
+  if (-not (Test-Path $gwPath)) { return }
+  $content = [System.IO.File]::ReadAllText($gwPath)
+  if ($content -match 'OPENCLAW_STATE_DIR') { return }
+  $stateDirEsc = $configDir.Replace('"', '""')
+  $inject = "set `"OPENCLAW_STATE_DIR=$stateDirEsc`"`r`n"
+  $newContent = $inject + $content
+  if ($newContent -ne $content) {
+    [System.IO.File]::WriteAllText($gwPath, $newContent, [System.Text.Encoding]::UTF8)
+  }
+}
+
+# 修复 .openclaw/gateway.cmd：当指向已删除路径时，用当前 openclaw 重写，并注入 OPENCLAW_STATE_DIR
 function Repair-GatewayCmdIfNeeded {
   $configDir = Get-OpenClawConfigDir
   $gwPath = Join-Path $configDir "gateway.cmd"
@@ -353,24 +399,27 @@ function Repair-GatewayCmdIfNeeded {
         $cfg = Get-Content (Join-Path $configDir "openclaw.json") -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
         $token = if ($cfg -and $cfg.gateway -and $cfg.gateway.auth -and $cfg.gateway.auth.token) { $cfg.gateway.auth.token } else { "" }
         $port = if ($cfg -and $cfg.gateway -and $cfg.gateway.port) { $cfg.gateway.port } else { "18789" }
-        $gwContent = "@echo off`r`nrem OpenClaw Gateway (repaired)`r`nset `"OPENCLAW_GATEWAY_PORT=$port`"`r`n"
+        $stateDirEsc = $configDir.Replace('"', '""')
+        $gwContent = "@echo off`r`nrem OpenClaw Gateway (repaired)`r`nset `"OPENCLAW_STATE_DIR=$stateDirEsc`"`r`nset `"OPENCLAW_GATEWAY_PORT=$port`"`r`n"
         if ($token) { $gwContent += "set `"OPENCLAW_GATEWAY_TOKEN=$token`"`r`n" }
         $gwContent += "`"$nodeExe`" `"$idxPath`" gateway --port $port`r`n"
         [System.IO.File]::WriteAllText($gwPath, $gwContent, [System.Text.Encoding]::UTF8)
       }
     }
   }
+  Patch-GatewayCmdStateDir
 }
 
 # 直接启动 Gateway（无窗口，后台运行）
 function Start-Gateway-Direct {
   Repair-GatewayCmdIfNeeded
   $ocDir = Split-Path $OPENCLAW_CMD -Parent
+  $cfgDir = Get-OpenClawConfigDir
   if (-not (Test-Path $OPENCLAW_CMD)) { return $false }
   try {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "cmd.exe"
-    $psi.Arguments = "/c `"$OPENCLAW_CMD`" gateway"
+    $psi.Arguments = "/c set `"OPENCLAW_STATE_DIR=$($cfgDir.Replace('"','""'))`" && `"$OPENCLAW_CMD`" gateway"
     $psi.WorkingDirectory = $ocDir
     $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
     $psi.CreateNoWindow = $true
@@ -379,6 +428,7 @@ function Start-Gateway-Direct {
     return $true
   } catch {
     try {
+      $env:OPENCLAW_STATE_DIR = $cfgDir
       Start-Process -FilePath $OPENCLAW_CMD -ArgumentList "gateway" -WorkingDirectory $ocDir -WindowStyle Hidden
       return $true
     } catch { return $false }
@@ -982,10 +1032,22 @@ function Get-ProviderBaseUrl {
     "openai" { return "https://api.openai.com/v1" }
     "moonshot" { return "https://api.moonshot.cn/v1" }
     "deepseek" { return "https://api.deepseek.com/v1" }
+    "siliconflow" { return "https://api.siliconflow.cn/v1" }
     "zai" { return "https://open.bigmodel.cn/api/paas/v4" }
     default { return "" }
   }
 }
+
+# === 固定硅基流动模型列表（引流用）===
+# 恢复提示：搜索 "FIXED_SILICONFLOW_MODELS" 和 "provider -eq `"siliconflow`""，
+# 删除 $FIXED_SILICONFLOW_MODELS 数组，将 siliconflow 分支改回与其它 provider 一样调用 Get-AvailableModels
+$FIXED_SILICONFLOW_MODELS = @(
+  @{ id = "deepseek-ai/DeepSeek-V3"; label = "DeepSeek V3（推荐）" },
+  @{ id = "Qwen/Qwen2.5-72B-Instruct"; label = "Qwen2.5 72B" },
+  @{ id = "GLM-4-9B-Chat"; label = "GLM-4-9B / GLM-5" },
+  @{ id = "moonshot/kimi-k2-turbo-preview"; label = "Kimi k2-turbo" },
+  @{ id = "deepseek-ai/DeepSeek-R1"; label = "DeepSeek R1（备选）" }
+)
 
 # 拉取模型列表 (与软件 discover_available_models 逻辑一致)
 function Get-AvailableModels {
@@ -1094,8 +1156,9 @@ while ($true) {
         Write-Host ("  [2] OpenAI (GPT)" + $(if ($oaOk) { " - 已配置" } else { "" })) -ForegroundColor $(if ($oaOk) { "Green" } else { "White" })
         Write-Host ("  [3] Moonshot (月之暗面)" + $(if ($oaOk) { " - 已配置" } else { "" })) -ForegroundColor $(if ($oaOk) { "Green" } else { "White" })
         Write-Host ("  [4] DeepSeek" + $(if ($oaOk) { " - 已配置" } else { "" })) -ForegroundColor $(if ($oaOk) { "Green" } else { "White" })
-        Write-Host ("  [5] Z.AI (智谱)" + $(if ($oaOk) { " - 已配置" } else { "" })) -ForegroundColor $(if ($oaOk) { "Green" } else { "White" })
-        Write-Host "  [6] 自定义 Base URL" -ForegroundColor White
+        Write-Host ("  [5] 硅基流动 (SiliconFlow)" + $(if ($oaOk) { " - 已配置" } else { "" })) -ForegroundColor $(if ($oaOk) { "Green" } else { "White" })
+        Write-Host ("  [6] Z.AI (智谱)" + $(if ($oaOk) { " - 已配置" } else { "" })) -ForegroundColor $(if ($oaOk) { "Green" } else { "White" })
+        Write-Host "  [7] 自定义 Base URL" -ForegroundColor White
         Write-Host "  [0] 取消" -ForegroundColor White
         Write-Host ""
         $providerChoice = Read-Host "请选择"
@@ -1109,8 +1172,9 @@ while ($true) {
           "2" { $provider = "openai"; $baseUrl = Get-ProviderBaseUrl "openai" }
           "3" { $provider = "moonshot"; $baseUrl = Get-ProviderBaseUrl "moonshot" }
           "4" { $provider = "deepseek"; $baseUrl = Get-ProviderBaseUrl "deepseek" }
-          "5" { $provider = "zai"; $baseUrl = Get-ProviderBaseUrl "zai" }
-          "6" {
+          "5" { $provider = "siliconflow"; $baseUrl = Get-ProviderBaseUrl "siliconflow" }
+          "6" { $provider = "zai"; $baseUrl = Get-ProviderBaseUrl "zai" }
+          "7" {
             $provider = "custom"
             $baseUrl = Read-Host "自定义 Base URL (如 https://api.openai.com/v1)"
             if (-not $baseUrl) {
@@ -1129,7 +1193,25 @@ while ($true) {
           continue
         }
         $modelId = ""
-        if ($provider -ne "custom") {
+        if ($provider -eq "siliconflow") {
+          Write-Host ""
+          Write-Host "--- 选择模型 (硅基流动) ---" -ForegroundColor Yellow
+          $i = 1
+          foreach ($m in $FIXED_SILICONFLOW_MODELS) {
+            Write-Host ('  [' + $i + '] ' + $m.label + ' (' + $m.id + ')') -ForegroundColor White
+            $i++
+          }
+          Write-Host ""
+          $sel = Read-Host "请选择 (1-$($FIXED_SILICONFLOW_MODELS.Count)，默认1)"
+          $sel = if ($sel) { $sel.Trim() } else { "1" }
+          $idx = 0
+          if ([int]::TryParse($sel, [ref]$idx) -and $idx -ge 1 -and $idx -le $FIXED_SILICONFLOW_MODELS.Count) {
+            $modelId = $FIXED_SILICONFLOW_MODELS[$idx - 1].id
+          } else {
+            $modelId = $FIXED_SILICONFLOW_MODELS[0].id
+          }
+          Write-Host "想用更多高端模型？加群 1088525353 解锁！" -ForegroundColor Cyan
+        } elseif ($provider -ne "custom") {
           Write-Host ""
           Write-Host "正在拉取可用模型列表..." -ForegroundColor Cyan
           $models = Get-AvailableModels -provider $provider -baseUrl $baseUrl -apiKey $apiKey
@@ -1167,6 +1249,7 @@ while ($true) {
             "openai" { $modelId = "gpt-4o-mini" }
             "moonshot" { $modelId = "moonshot-v1-32k" }
             "deepseek" { $modelId = "deepseek-chat" }
+            "siliconflow" { $modelId = "deepseek-ai/DeepSeek-V3" }
             "zai" { $modelId = "glm-4-flash" }
             default { $modelId = "gpt-4o-mini" }
           }
@@ -1288,34 +1371,70 @@ while ($true) {
       Pause-Wait
     }
     "7" {
-      Write-Host ""
-      $ocDir = Split-Path $OPENCLAW_CMD -Parent
-      Write-Host "配置路径: $OPENCLAW_CONFIG" -ForegroundColor Cyan
-      Write-Host "  (存放 openclaw.json、channels.json 等用户配置)" -ForegroundColor DarkGray
-      Write-Host "OpenClaw 路径: $ocDir" -ForegroundColor Cyan
-      Write-Host "  (openclaw.cmd 所在目录，即程序安装位置)" -ForegroundColor DarkGray
-      Write-Host ""
-      if (Test-Path $OPENCLAW_CONFIG) {
-        Write-Host "配置目录内容:" -ForegroundColor DarkGray
-        $items = Get-ChildItem $OPENCLAW_CONFIG -ErrorAction SilentlyContinue | Select-Object -First 15
-        foreach ($i in $items) { Write-Host "  $($i.Name)" -ForegroundColor DarkGray }
-      } else {
-        Write-Host "`[提示`] 目录不存在，请先运行快速配置" -ForegroundColor Yellow
-      }
-      Write-Host ""
-      if (-not (Test-OpenClawPathInUserEnv)) {
-        $add = Read-Host "是否一键添加 OpenClaw 路径到 PATH? (y/N)"
-        if ($add -eq 'y' -or $add -eq 'Y') {
-          if (Add-OpenClawToPath) {
-            Write-Host "`[OK`] 已添加到 PATH，新开终端后生效" -ForegroundColor Green
-          } else {
-            Write-Host "`[提示`] 添加失败或已在 PATH 中" -ForegroundColor Yellow
+      :cfgmenu while ($true) {
+        Write-Host ""
+        Write-Host "--- 配置路径 ---" -ForegroundColor Yellow
+        $ocDir = Split-Path $OPENCLAW_CMD -Parent
+        Write-Host "  当前配置路径: $OPENCLAW_CONFIG" -ForegroundColor Cyan
+        Write-Host "  (存放 openclaw.json、channels.json 等，Gateway 与脚本需一致)" -ForegroundColor DarkGray
+        Write-Host "  OpenClaw 安装路径: $ocDir" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  [a] 设置自定义配置路径 - 安装在其他盘时填写" -ForegroundColor White
+        Write-Host "  [b] 恢复默认路径 - 清空自定义，使用 ~/.openclaw" -ForegroundColor White
+        Write-Host "  [c] 一键添加 OpenClaw 到 PATH" -ForegroundColor White
+        Write-Host "  [d] 安装在其他盘时如何填写？- 查看指引" -ForegroundColor White
+        Write-Host "  [0] 返回主菜单" -ForegroundColor White
+        Write-Host ""
+        $cfgChoice = Read-Host "请选择"
+        $cfgChoice = if ($cfgChoice) { $cfgChoice.Trim().ToLower() } else { "" }
+        if ($cfgChoice -eq "0") { break cfgmenu }
+        if ($cfgChoice -eq "a") {
+          Write-Host ""
+          Write-Host "填写配置目录完整路径（内含 openclaw.json 的文件夹）" -ForegroundColor Cyan
+          Write-Host "示例: D:\openclaw\.openclaw  或  E:\my-config" -ForegroundColor DarkGray
+          $customPath = Read-Host "路径 (留空取消)"
+          $customPath = Sanitize-PathInput $customPath
+          if (-not $customPath) { Write-Host "已取消" -ForegroundColor DarkGray; Pause-Wait; continue }
+          $cfgFile = Join-Path $customPath "openclaw.json"
+          if (-not (Test-Path $cfgFile)) {
+            Write-Host "`[提示`] 该目录下未找到 openclaw.json，请确认路径正确" -ForegroundColor Yellow
+            $force = Read-Host "仍要设置? (y/N)"
+            if ($force -ne 'y' -and $force -ne 'Y') { Pause-Wait; continue }
           }
-        }
-      } else {
-        Write-Host "`[OK`] OpenClaw 路径已在 PATH 中" -ForegroundColor Green
+          [Environment]::SetEnvironmentVariable("OPENCLAW_STATE_DIR", $customPath, "User")
+          $env:OPENCLAW_STATE_DIR = $customPath
+          $script:OPENCLAW_CONFIG = $customPath
+          Write-Host "`[OK`] 已设置，新开终端后生效；当前会话已切换" -ForegroundColor Green
+          Write-Host "请执行 gateway install --force 或选项 10->e 修复 Gateway 任务" -ForegroundColor DarkGray
+          Pause-Wait
+        } elseif ($cfgChoice -eq "b") {
+          [Environment]::SetEnvironmentVariable("OPENCLAW_STATE_DIR", $null, "User")
+          Remove-Item Env:OPENCLAW_STATE_DIR -ErrorAction SilentlyContinue
+          $script:OPENCLAW_CONFIG = "$env:USERPROFILE\.openclaw"
+          Write-Host "`[OK`] 已恢复默认路径" -ForegroundColor Green
+          Pause-Wait
+        } elseif ($cfgChoice -eq "c") {
+          if (-not (Test-OpenClawPathInUserEnv)) {
+            if (Add-OpenClawToPath) {
+              Write-Host "`[OK`] 已添加到 PATH，新开终端后生效" -ForegroundColor Green
+            } else {
+              Write-Host "`[提示`] 添加失败或已在 PATH 中" -ForegroundColor Yellow
+            }
+          } else {
+            Write-Host "`[OK`] OpenClaw 路径已在 PATH 中" -ForegroundColor Green
+          }
+          Pause-Wait
+        } elseif ($cfgChoice -eq "d") {
+          Write-Host ""
+          Write-Host "--- 安装在其他盘时如何填写配置路径 ---" -ForegroundColor Yellow
+          Write-Host "  1. 填写的是「配置目录」，不是 OpenClaw 程序安装目录" -ForegroundColor White
+          Write-Host "  2. 在资源管理器中找到含 openclaw.json 的文件夹，复制地址栏路径" -ForegroundColor White
+          Write-Host "  3. 常见位置: D:\openclaw\.openclaw  E:\openclaw-config" -ForegroundColor White
+          Write-Host "  4. 可用 \ 或 /，末尾不要加反斜杠" -ForegroundColor White
+          Write-Host ""
+          Pause-Wait
+        } else { Write-Host "无效输入" -ForegroundColor Yellow }
       }
-      Pause-Wait
     }
     "8" {
       Write-Host ""
@@ -1561,7 +1680,9 @@ while ($true) {
           Start-Sleep -Seconds 2
           $del = schtasks /delete /tn "OpenClaw Gateway" /f 2>$null
           Start-Sleep -Seconds 1
+          $env:OPENCLAW_STATE_DIR = Get-OpenClawConfigDir
           Run-OpenClaw "gateway install --force" | Out-Null
+          Patch-GatewayCmdStateDir
           if ($LASTEXITCODE -eq 0) {
             Start-Sleep -Seconds 1
             if (Start-Gateway-Hidden) {
@@ -1589,8 +1710,10 @@ while ($true) {
           Write-Host "将在新窗口启动 Gateway，不依赖计划任务。请保持该窗口不关闭。" -ForegroundColor DarkGray
           Write-Host ""
           $ocDir = Split-Path $OPENCLAW_CMD -Parent
+          $cfgDir = Get-OpenClawConfigDir
+          $cmdLine = "set `"OPENCLAW_STATE_DIR=$($cfgDir.Replace('"','""'))`" && openclaw gateway"
           try {
-            Start-Process -FilePath "cmd.exe" -ArgumentList "/k", "openclaw gateway" -WorkingDirectory $ocDir
+            Start-Process -FilePath "cmd.exe" -ArgumentList "/k", $cmdLine -WorkingDirectory $ocDir
             Write-Host "`[OK`] 已在新窗口启动，Gateway 就绪后访问: http://127.0.0.1:18789/" -ForegroundColor Green
           } catch {
             Write-Host "`[提示`] 请手动新开 cmd 运行: openclaw gateway" -ForegroundColor Yellow

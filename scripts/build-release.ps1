@@ -74,11 +74,22 @@ if (Test-Path $shellPs1) {
     Copy-Item $shellPs1 $releaseDir
     Write-Host "  - OpenClaw_Shell.ps1" -ForegroundColor Green
 }
+$shellBootstrap = Join-Path $root "scripts\OpenClaw_Shell_Bootstrap.ps1"
+if (Test-Path $shellBootstrap) {
+    Copy-Item $shellBootstrap $releaseDir
+    Write-Host "  - OpenClaw_Shell_Bootstrap.ps1" -ForegroundColor Green
+}
+# Linux/macOS Shell
+$shellSh = Join-Path $root "scripts\OpenClaw_Shell.sh"
+if (Test-Path $shellSh) {
+    Copy-Item $shellSh $releaseDir
+    Write-Host "  - OpenClaw_Shell.sh (Linux/macOS)" -ForegroundColor Green
+}
 
-# 使用文档
-$docPath = Join-Path $root "使用文档.md"
-if (Test-Path $docPath) {
-    Copy-Item $docPath $releaseDir
+# 使用文档（通过枚举避免中文路径编码问题）
+$docFile = Get-ChildItem -Path $root -Filter "*.md" -File | Where-Object { $_.Name -ne "README.md" } | Select-Object -First 1
+if ($docFile) {
+    Copy-Item $docFile.FullName (Join-Path $releaseDir $docFile.Name) -Force
     Write-Host "  - 使用文档.md" -ForegroundColor Green
 }
 

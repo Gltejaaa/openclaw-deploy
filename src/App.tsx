@@ -170,7 +170,15 @@ const STEPS = [
 const DEFAULT_OPENAI_BASE_URL = "https://api.siliconflow.cn/v1";
 const DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1";
 const RECOMMENDED_MODEL_FALLBACK = "deepseek-ai/DeepSeek-V3";
-const RECOMMENDED_MODEL_SECOND = "Qwen/Qwen2.5-72B-Instruct";
+
+/** 固定硅基流动模型列表（引流用，后续接入自建中转支持更多） */
+const FIXED_SILICONFLOW_MODELS: { id: string; label: string }[] = [
+  { id: "deepseek-ai/DeepSeek-V3", label: "DeepSeek V3（推荐）" },
+  { id: "Qwen/Qwen2.5-72B-Instruct", label: "Qwen2.5 72B" },
+  { id: "GLM-4-9B-Chat", label: "GLM-4-9B / GLM-5" },
+  { id: "moonshot/kimi-k2-turbo-preview", label: "Kimi k2-turbo" },
+  { id: "deepseek-ai/DeepSeek-R1", label: "DeepSeek R1（备选）" },
+];
 const DEPLOY_SUCCESS_DIALOG =
   "恭喜部署完成！作者已为你配置稳定代理API（每天免费额度）。加QQ群1088525353领更多额度或29元无限包月。";
 
@@ -208,9 +216,7 @@ function App() {
   const [saveResult, setSaveResult] = useState<string | null>(null);
   const [modelTesting, setModelTesting] = useState(false);
   const [modelTestResult, setModelTestResult] = useState<string | null>(null);
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState(RECOMMENDED_MODEL_FALLBACK);
-  const [modelsLoading, setModelsLoading] = useState(false);
   const [runtimeModelInfo, setRuntimeModelInfo] = useState<RuntimeModelInfo | null>(null);
   const [keySyncStatus, setKeySyncStatus] = useState<KeySyncStatus | null>(null);
   const [runtimeProbeResult, setRuntimeProbeResult] = useState<string | null>(null);
@@ -297,6 +303,13 @@ function App() {
       } else {
         setCustomConfigPath(savedConfig);
       }
+    } else {
+      // 无保存路径时自动检测并填充
+      invoke<string | null>("detect_openclaw_config_path")
+        .then((p) => {
+          if (p && isLikelyConfigPath(p)) setCustomConfigPath(p);
+        })
+        .catch(() => {});
     }
     runEnvCheck(savedInstall || undefined);
   }, []);
@@ -394,8 +407,8 @@ function App() {
 
   useEffect(() => {
     setModelTestResult(null);
-    setAvailableModels([]);
-    setSelectedModel((prev) => prev || RECOMMENDED_MODEL_FALLBACK);
+    const ids = FIXED_SILICONFLOW_MODELS.map((m) => m.id);
+    setSelectedModel((prev) => (ids.includes(prev) ? prev : RECOMMENDED_MODEL_FALLBACK));
   }, [provider, baseUrl, apiKey]);
 
   useEffect(() => {
@@ -507,7 +520,9 @@ function App() {
       });
       setRuntimeModelInfo(data);
       const raw = data.model?.includes("/") ? data.model.split("/").slice(1).join("/") : data.model;
-      if (raw) setSelectedModel(raw);
+      const ids = FIXED_SILICONFLOW_MODELS.map((m) => m.id);
+      if (raw && ids.includes(raw)) setSelectedModel(raw);
+      else if (raw) setSelectedModel(RECOMMENDED_MODEL_FALLBACK);
     } catch {
       setRuntimeModelInfo(null);
     }
@@ -524,35 +539,6 @@ function App() {
     }
   };
 
-  const fetchAvailableModels = async (cfgPath?: string) => {
-    setModelsLoading(true);
-    try {
-      const models = await invoke<string[]>("discover_available_models", {
-        provider,
-        baseUrl: baseUrl.trim() || undefined,
-        apiKey: apiKey.trim() || undefined,
-        customPath: normalizeConfigPath(cfgPath || customConfigPath) || undefined,
-      });
-      setAvailableModels(models);
-      setSelectedModel((prev) => {
-        if (prev && models.includes(prev)) return prev;
-        const deepseekV3 = models.find(
-          (m) => m.toLowerCase() === "deepseek-ai/deepseek-v3"
-        );
-        if (deepseekV3) return deepseekV3;
-        const qwen72b = models.find(
-          (m) => m.toLowerCase() === "qwen/qwen2.5-72b-instruct"
-        );
-        if (qwen72b) return qwen72b;
-        const deepseek = models.find((m) => m.toLowerCase().includes("deepseek"));
-        if (deepseek) return deepseek;
-        return models[0] || RECOMMENDED_MODEL_FALLBACK;
-      });
-      return models;
-    } finally {
-      setModelsLoading(false);
-    }
-  };
 
   const probeRuntimeModelConnection = async (cfgPath?: string) => {
     if (runtimeProbeLoading) return;
@@ -758,16 +744,7 @@ function App() {
         apiKey: apiKey.trim() || undefined,
         customPath: normalizeConfigPath(customConfigPath) || undefined,
       });
-      let nextMsg = result;
-      try {
-        const models = await fetchAvailableModels();
-        if (models.length > 0) {
-          nextMsg = `${result}；已自动筛选到 ${models.length} 个可用模型，请选择后保存`;
-        }
-      } catch (e) {
-        nextMsg = `${result}；模型列表拉取失败：${e}`;
-      }
-      setModelTestResult(nextMsg);
+      setModelTestResult(result);
       await loadRuntimeModelInfo();
     } catch (e) {
       setModelTestResult(`检测失败: ${e}`);
@@ -1462,7 +1439,7 @@ function App() {
                     setProvider(next);
                     if (next === "kimi") {
                       setBaseUrl(DEFAULT_KIMI_BASE_URL);
-                      setSelectedModel("moonshot-v1-32k");
+                      setSelectedModel("moonshot/kimi-k2-turbo-preview");
                     } else if (next === "openai" || next === "deepseek" || next === "qwen") {
                       if (!baseUrl.trim() || baseUrl.trim() === DEFAULT_KIMI_BASE_URL) {
                         setBaseUrl(DEFAULT_OPENAI_BASE_URL);
@@ -1501,36 +1478,22 @@ function App() {
               </div>
               <div>
                 <label className="block text-sm font-medium mb-2">
-                  可用模型 <span className="text-slate-500">(检测后自动拉取)</span>
+                  可用模型 <span className="text-slate-500">(硅基流动)</span>
                 </label>
-                <div className="flex gap-2">
-                  <select
-                    value={selectedModel}
-                    onChange={(e) => setSelectedModel(e.target.value)}
-                    className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
-                    disabled={modelsLoading}
-                  >
-                    {availableModels.length === 0 ? (
-                      <>
-                        <option value={RECOMMENDED_MODEL_FALLBACK}>{RECOMMENDED_MODEL_FALLBACK}（推荐）</option>
-                        <option value={RECOMMENDED_MODEL_SECOND}>{RECOMMENDED_MODEL_SECOND}（推荐）</option>
-                      </>
-                    ) : (
-                      availableModels.map((m) => (
-                        <option key={m} value={m}>
-                          {m}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                  <button
-                    onClick={() => fetchAvailableModels()}
-                    disabled={modelsLoading}
-                    className="px-3 py-2 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-sm whitespace-nowrap"
-                  >
-                    {modelsLoading ? "拉取中..." : "刷新模型"}
-                  </button>
-                </div>
+                <select
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
+                >
+                  {FIXED_SILICONFLOW_MODELS.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-sky-300 text-xs mt-2">
+                  想用更多高端模型？加群 1088525353 解锁！
+                </p>
                 {selectedModel && (() => {
                   const inferred = inferModelContextWindow(selectedModel);
                   if (inferred !== null && inferred < 16000) {
@@ -1613,16 +1576,39 @@ function App() {
                 <label className="block text-sm font-medium mb-2">
                   自定义配置路径 <span className="text-slate-500">(可选)</span>
                 </label>
-                <input
-                  type="text"
-                  value={customConfigPath}
-                  onChange={(e) => setCustomConfigPath(e.target.value)}
-                  placeholder="留空使用 ~/.openclaw，如 D:\\openclaw-config"
-                  className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={customConfigPath}
+                    onChange={(e) => setCustomConfigPath(e.target.value)}
+                    placeholder="留空使用 ~/.openclaw，如 D:\\openclaw-config"
+                    className="flex-1 bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        const p = await invoke<string | null>("detect_openclaw_config_path");
+                        if (p && isLikelyConfigPath(p)) setCustomConfigPath(p);
+                      } catch {}
+                    }}
+                    className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm whitespace-nowrap"
+                  >
+                    自动检测
+                  </button>
+                </div>
                 <p className="text-slate-500 text-xs mt-1">
-                  配置、凭证、会话数据将存储在此目录
+                  配置、凭证、会话数据将存储在此目录。建议留空使用默认，避免 Gateway 与部署工具路径不一致导致 Telegram 无响应。
                 </p>
+                <details className="mt-2 text-xs text-slate-400">
+                  <summary className="cursor-pointer hover:text-slate-300">安装在其他盘时如何填写？</summary>
+                  <ul className="mt-1 ml-4 list-disc space-y-0.5 text-slate-500">
+                    <li>填写<strong className="text-slate-400">配置目录</strong>的完整路径（内含 openclaw.json 的文件夹）</li>
+                    <li>示例：<code className="bg-slate-800 px-1 rounded">D:\openclaw\.openclaw</code>、<code className="bg-slate-800 px-1 rounded">E:\my-config</code></li>
+                    <li>可用 <code className="bg-slate-800 px-1 rounded">\</code> 或 <code className="bg-slate-800 px-1 rounded">/</code>，末尾不要加反斜杠</li>
+                    <li>不确定时先点「自动检测」；若检测不到，在资源管理器中找到含 openclaw.json 的文件夹，复制其地址栏路径粘贴即可</li>
+                  </ul>
+                </details>
               </div>
               {runtimeModelInfo && (
                 <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-3 text-xs text-slate-300 space-y-1">

@@ -1,4 +1,4 @@
-# OpenClaw 仅安装 - 无菜单，用于 CMD fallback
+﻿# OpenClaw 仅安装 - 无菜单，用于 CMD fallback
 # 第一页检测 -> 第二页安装选项 -> 安装进度
 $ErrorActionPreference = "Continue"
 try { chcp 65001 | Out-Null } catch {}

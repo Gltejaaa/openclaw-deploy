@@ -1,4 +1,4 @@
-# Bootstrap - ASCII only, loads main script with explicit UTF-8
+﻿# Bootstrap - ASCII only, loads main script with explicit UTF-8
 # Fixes PowerShell 5.1 encoding: -File reads as system default, so we read UTF-8 and invoke
 $ErrorActionPreference = "Continue"
 try { chcp 65001 | Out-Null } catch {}

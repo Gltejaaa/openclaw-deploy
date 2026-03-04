@@ -6,12 +6,11 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
-echo -e "${GREEN}====================================${NC}"
-echo -e "    OpenClaw 一键部署工具 v1.0"
-echo -e "${GREEN}====================================${NC}"
-echo ""
+# 支持参数: menu = 交互式菜单, 无参数 = 一键安装
+MODE="${1:-}"
 
 # 检测操作系统
 OS="$(uname -s)"
@@ -21,8 +20,6 @@ case "${OS}" in
     MINGW*|MSYS*|CYGWIN*) MACHINE=Windows;;
     *)          MACHINE="UNKNOWN:${OS}"
 esac
-
-echo -e "检测到系统：${YELLOW}${MACHINE}${NC}"
 
 if [[ "${MACHINE}" == "Windows" ]]; then
     echo -e "${YELLOW}Windows 用户推荐使用图形化桌面版（双击安装）${NC}"
@@ -34,6 +31,33 @@ if [[ "${MACHINE}" == "Windows" ]]; then
     read -r
     exit 0
 fi
+
+# menu 模式：运行交互式 Shell（与 Windows OpenClaw_Shell.ps1 对应）
+if [[ "${MODE}" == "menu" ]] || [[ "${MODE}" == "shell" ]]; then
+    SHELL_SCRIPT=""
+    if [[ -n "${BASH_SOURCE[0]:-}" ]] && [[ -f "${BASH_SOURCE[0]}" ]]; then
+        BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        [[ -f "$BASE/scripts/OpenClaw_Shell.sh" ]] && SHELL_SCRIPT="$BASE/scripts/OpenClaw_Shell.sh"
+    fi
+    if [[ -n "$SHELL_SCRIPT" ]]; then
+        exec bash "$SHELL_SCRIPT" "${@:2}"
+    fi
+    if command -v curl &>/dev/null; then
+        echo -e "${CYAN}正在启动交互式菜单...${NC}"
+        curl -fsSL https://raw.githubusercontent.com/3445286649/openclaw-deploy/main/scripts/OpenClaw_Shell.sh | bash
+        exit 0
+    fi
+    echo -e "${RED}需要 curl。或 clone 仓库后运行: ./scripts/OpenClaw_Shell.sh${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}====================================${NC}"
+echo -e "    OpenClaw 一键部署工具 v1.0"
+echo -e "${GREEN}====================================${NC}"
+echo ""
+echo -e "检测到系统：${YELLOW}${MACHINE}${NC}"
+echo -e "${GRAY}提示: 使用  curl ... | bash -s menu  可进入交互式菜单${NC}"
+echo ""
 
 # Linux / macOS 安装逻辑
 echo -e "${GREEN}开始安装 OpenClaw...${NC}"

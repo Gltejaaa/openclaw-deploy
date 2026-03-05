@@ -383,18 +383,22 @@ open_docs() {
   fi
 }
 
-# 嗅探 OpenClaw 安装位置
+# 嗅探 OpenClaw 安装位置（与 find_openclaw 检测逻辑一致，避免「已安装」但「无可删除」）
 find_openclaw_locations() {
   local current_dir
   if [[ "$OPENCLAW_CMD" == */* ]]; then
     current_dir="${OPENCLAW_CMD%/*}"
   else
-    current_dir=$(dirname "$(command -v $OPENCLAW_CMD 2>/dev/null)" 2>/dev/null)
+    # command -v openclaw 可找到 PATH 中的实际路径，与第一页检测一致
+    current_dir=$(dirname "$(command -v openclaw 2>/dev/null)" 2>/dev/null)
   fi
-  local npm_prefix npm_root
-  npm_prefix=$(npm config get prefix 2>/dev/null)
-  npm_root=$(npm root -g 2>/dev/null)
-  for dir in /usr/local/bin /opt/homebrew/bin "$HOME/.local/bin" "${npm_prefix%/}/bin" "${npm_root%/}/../bin"; do
+  local npm_prefix npm_root path_dir
+  npm_prefix=$(npm config get prefix 2>/dev/null) || true
+  npm_root=$(npm root -g 2>/dev/null) || true
+  path_dir=$(command -v openclaw 2>/dev/null | xargs dirname 2>/dev/null) || true
+  # 加入 PATH 中 openclaw 所在目录，确保与第一页「已安装」检测一致
+  for dir in /usr/local/bin /opt/homebrew/bin "$HOME/.local/bin" "$HOME/.npm-global/bin" \
+      "${npm_prefix%/}/bin" "${npm_root%/}/../bin" "$path_dir"; do
     [[ -z "$dir" || ! -d "$dir" ]] && continue
     dir="${dir%/}"
     [[ -x "$dir/openclaw" ]] || continue
@@ -402,7 +406,7 @@ find_openclaw_locations() {
     ver=$("$dir/openclaw" --version 2>/dev/null) || true
     [[ "$dir" == "$current_dir" ]] && cur=" (当前)"
     echo "$dir|$ver|$cur"
-  done
+  done | sort -u -t'|' -k1,1
 }
 
 # 环境检测与安装
@@ -698,6 +702,7 @@ main() {
           case "$im" in
             a)
               echo ""
+              OPENCLAW_CMD=$(find_openclaw)
               local locs line dir ver cur
               locs=$(find_openclaw_locations 2>/dev/null || true)
               if [[ -z "$locs" ]]; then
@@ -717,6 +722,7 @@ main() {
               ;;
             b)
               echo ""
+              OPENCLAW_CMD=$(find_openclaw)
               local locs_arr=() i=1 sel idx target_dir prefix
               while IFS= read -r line; do
                 [[ -z "$line" ]] && continue

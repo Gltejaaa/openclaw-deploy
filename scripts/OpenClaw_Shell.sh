@@ -134,9 +134,26 @@ stop_gateway() {
   fi
 }
 
-# 打开浏览器
+# 从 openclaw.json 读取 gateway token（避免 unauthorized / too many failed attempts）
+get_gateway_token() {
+  local cfg="$OPENCLAW_CONFIG/openclaw.json"
+  [[ ! -f "$cfg" ]] && return
+  if command -v jq &>/dev/null; then
+    jq -r '.gateway.auth.token // empty' "$cfg" 2>/dev/null
+  else
+    sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" 2>/dev/null | head -1
+  fi
+}
+
+# 打开浏览器（自动附带 token，避免认证失败）
 open_browser() {
   local url="http://127.0.0.1:18789/"
+  local token
+  token=$(get_gateway_token)
+  if [[ -n "$token" ]]; then
+    url="${url}?token=$token"
+    echo -e "${GRAY}  使用 token 打开，避免认证失败${NC}"
+  fi
   if command -v xdg-open &>/dev/null; then
     xdg-open "$url" 2>/dev/null &
   elif command -v open &>/dev/null; then
@@ -212,7 +229,7 @@ write_ticket_summary() {
   echo -e "${YELLOW}----------------------------------------${NC}"
 }
 
-# 渠道状态（用 jq 或 grep 解析）
+# 渠道状态（用 jq 或 grep 解析，避免 set -e 导致退出）
 show_channel_status() {
   echo ""
   echo -e "${YELLOW}--- 渠道状态 ---${NC}"
@@ -228,9 +245,9 @@ show_channel_status() {
       local label="${name%%:*}" id="${name#*:}"
       local ok=""
       if command -v jq &>/dev/null; then
-        ok=$(jq -r --arg c "$id" '.channels[$c] // .[$c] // empty' $check_file 2>/dev/null | head -1)
+        ok=$(jq -r --arg c "$id" '.channels[$c] // .[$c] // empty' $check_file 2>/dev/null | head -1) || true
       fi
-      [[ -z "$ok" ]] && ok=$(grep -l "\"$id\"" $check_file 2>/dev/null | head -1)
+      [[ -z "$ok" ]] && ok=$(grep -l "\"$id\"" $check_file 2>/dev/null | head -1) || true
       if [[ -n "$ok" ]]; then
         echo -e "  ${GREEN}$label: 已配置${NC}"
       else
@@ -676,7 +693,7 @@ main() {
           echo ""
           echo -e "${YELLOW}--- 安装管理 ---${NC}"
           echo "  [a] 一键嗅探 - 检测所有 OpenClaw 安装"
-          echo "  [b] 删除安装  [c] 热迁移  [0] 返回"
+          echo "  [b] 删除安装 - 选择后自动卸载  [c] 热迁移  [0] 返回"
           read_input -p "选择: " im
           case "$im" in
             a)
@@ -698,7 +715,55 @@ main() {
                 done <<< "$locs"
               fi
               ;;
-            b|c) echo -e "${GRAY}请手动删除或迁移目录后重装${NC}" ;;
+            b)
+              echo ""
+              local locs_arr=() i=1 sel idx target_dir prefix
+              while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                dir="${line%%|*}"
+                locs_arr+=("$dir")
+                ver="${line#*|}"
+                cur="${ver##*|}"
+                ver="${ver%|*}"
+                echo -e "  [$i] $dir${ver:+ $ver}$cur"
+                ((i++)) || true
+              done <<< "$(find_openclaw_locations 2>/dev/null || true)"
+              if [[ ${#locs_arr[@]} -eq 0 ]]; then
+                echo -e "${YELLOW}无可删除的安装${NC}"
+              else
+                echo "  [0] 取消"
+                read_input -p "选择要删除的安装: " sel
+                sel="${sel:-0}"
+                if [[ "$sel" != "0" ]] && [[ "$sel" =~ ^[0-9]+$ ]]; then
+                  idx=$((sel))
+                  if [[ $idx -ge 1 && $idx -le ${#locs_arr[@]} ]]; then
+                    target_dir="${locs_arr[$((idx-1))]}"
+                    read_input -p "确认删除 $target_dir ? (y/N): " confirm
+                    confirm="${confirm:-n}"
+                    if [[ "${confirm,,}" == "y" || "${confirm,,}" == "yes" ]]; then
+                      prefix="${target_dir%/bin}"
+                      [[ "$prefix" == "$target_dir" ]] && prefix="$(dirname "$target_dir")"
+                      if npm uninstall -g openclaw --prefix "$prefix" 2>/dev/null; then
+                        echo -e "${GREEN}[OK] 已卸载${NC}"
+                      else
+                        rm -f "$target_dir/openclaw" 2>/dev/null || true
+                        rm -rf "$prefix/node_modules/openclaw" "$prefix/lib/node_modules/openclaw" 2>/dev/null || true
+                        if [[ ! -f "$target_dir/openclaw" ]]; then
+                          echo -e "${GREEN}[OK] 已删除${NC}"
+                        else
+                          echo -e "${YELLOW}卸载未完成，请手动删除: $target_dir/openclaw${NC}"
+                        fi
+                      fi
+                    else
+                      echo "已取消"
+                    fi
+                  else
+                    echo "无效选择"
+                  fi
+                fi
+              fi
+              ;;
+            c) echo -e "${GRAY}请手动迁移目录后重装${NC}" ;;
             0) break ;;
             *) echo "无效" ;;
           esac

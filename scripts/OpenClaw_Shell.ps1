@@ -1,4 +1,4 @@
-﻿# OpenClaw Shell - UTF-8 with BOM
+# OpenClaw Shell - UTF-8 with BOM
 param(
   [string]$Action = ""
 )
@@ -833,12 +833,16 @@ function Invoke-ChannelSetup {
   if ($plugin) {
     Write-Host ""
     Write-Host ("正在安装 $channelName 插件: $plugin ...") -ForegroundColor Cyan
-    & $OPENCLAW_CMD plugins install "${plugin}@latest"
+    $env:OPENCLAW_STATE_DIR = Get-OpenClawConfigDir
+    $plugErr = ""
+    try { & $OPENCLAW_CMD plugins install "${plugin}@latest" 2>&1 | Tee-Object -Variable plugErr | Out-Null } catch { $plugErr = $_.Exception.Message }
     if ($LASTEXITCODE -ne 0) {
       Write-Host "`[失败`] 插件安装失败，请检查网络" -ForegroundColor Red
+      Write-TicketSummary "渠道插件安装 ($channelName)" $plugErr | Out-Null
       Pause-Wait
       return
     }
+    Ensure-ExtensionManifestCompat | Out-Null
     Write-Host "`[OK`] 插件已安装" -ForegroundColor Green
   }
 
@@ -994,6 +998,84 @@ function Export-Diagnostic {
   } catch { return $null }
 }
 
+# 插件 manifest 补齐：extensions 下 clawdbot.plugin.json -> openclaw.plugin.json（避免 plugin manifest not found）
+function Ensure-ExtensionManifestCompat {
+  $configDir = Get-OpenClawConfigDir
+  $extRoot = Join-Path $configDir "extensions"
+  if (-not (Test-Path $extRoot)) { return @() }
+  $fixed = @()
+  foreach ($dir in (Get-ChildItem -Path $extRoot -Directory -ErrorAction SilentlyContinue)) {
+    $oldManifest = Join-Path $dir.FullName "clawdbot.plugin.json"
+    $newManifest = Join-Path $dir.FullName "openclaw.plugin.json"
+    if ((Test-Path $oldManifest) -and -not (Test-Path $newManifest)) {
+      try {
+        Copy-Item -Path $oldManifest -Destination $newManifest -Force
+        $fixed += $dir.Name
+      } catch {}
+    }
+  }
+  return $fixed
+}
+
+# 一键最小修复：manifest补齐 -> doctor --fix -> plugins校验 -> skills check -> gateway自检
+function Invoke-MinimalRepair {
+  $configDir = Get-OpenClawConfigDir
+  $env:OPENCLAW_STATE_DIR = $configDir
+  $logs = @()
+  $logs += "配置目录: $configDir"
+
+  Write-Host ""
+  Write-Host "`[1/5`] manifest 补齐..." -ForegroundColor Cyan
+  $fixed = Ensure-ExtensionManifestCompat
+  if ($fixed.Count -gt 0) {
+    $logs += "manifest补齐: 已修复 $($fixed.Count) 项 [$($fixed -join ', ')]"
+    Write-Host "`[OK`] 已补齐 $($fixed.Count) 个插件 manifest" -ForegroundColor Green
+  } else {
+    $logs += "manifest补齐: 无变更"
+    Write-Host "`[OK`] 无需补齐" -ForegroundColor DarkGray
+  }
+
+  Write-Host "`[2/5`] doctor --fix..." -ForegroundColor Cyan
+  Run-OpenClaw "doctor --fix" 2>$null | Out-Null
+  $logs += "doctor --fix: 已执行"
+
+  Write-Host "`[3/5`] plugins 校验..." -ForegroundColor Cyan
+  $pOut = Run-OpenClaw "plugins list" 2>&1 | Out-String
+  $logs += "plugins: $(if ($LASTEXITCODE -eq 0) { 'ok' } else { 'error' })"
+
+  Write-Host "`[4/5`] skills check..." -ForegroundColor Cyan
+  Run-OpenClaw "skills check" 2>$null | Out-Null
+  $logs += "skills check: 已执行"
+
+  Write-Host "`[5/5`] gateway 自检..." -ForegroundColor Cyan
+  $gwOk = Test-GatewayRunning
+  $logs += "gateway: $(if ($gwOk) { '运行中' } else { '已停止' })"
+  Write-Host ("`[OK`] Gateway: $(if ($gwOk) { '运行中' } else { '已停止' })") -ForegroundColor $(if ($gwOk) { "Green" } else { "DarkGray" })
+
+  Write-Host ""
+  Write-Host "`[完成`] 最小修复已执行" -ForegroundColor Green
+  return ($logs -join "`n")
+}
+
+# 生成可复制工单摘要（失败时供用户发给维护者）
+function Write-TicketSummary {
+  param([string]$Action, [string]$ErrorMsg)
+  $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+  $firstLine = ($ErrorMsg -split "`n")[0]
+  if (-not $firstLine) { $firstLine = $ErrorMsg }
+  $summary = @"
+时间: $ts
+操作: $Action
+错误摘要: $firstLine
+建议: 点击「一键最小修复」后重试；若仍失败请附上完整日志与截图。
+"@
+  Write-Host ""
+  Write-Host "--- 可复制工单摘要（发给维护者）---" -ForegroundColor Yellow
+  Write-Host $summary -ForegroundColor White
+  Write-Host "----------------------------------------" -ForegroundColor Yellow
+  return $summary
+}
+
 # 获取 npm 上最新版本号
 function Get-LatestOpenClawVersion {
   try {
@@ -1099,9 +1181,10 @@ if (-not (Ensure-OpenClaw)) {
 }
 
 # 命令行快捷模式
-$act = if ($Action) { $Action.Trim().ToLower() } else { "" }
+  $act = if ($Action) { $Action.Trim().ToLower() } else { "" }
 if ($act) {
   switch ($act) {
+    "minimal-repair" { Invoke-MinimalRepair | Out-Null; exit 0 }
     "gateway-start" { if (Start-Gateway-AndWait) { Write-Host "Gateway started" -ForegroundColor Green } else { Write-Host "Gateway start failed" -ForegroundColor Red }; exit 0 }
     "gateway-stop" { Run-OpenClaw "gateway stop" | Out-Null; exit 0 }
     "open-chat" {
@@ -1114,7 +1197,7 @@ if ($act) {
     }
     "status" { Run-OpenClaw "status"; exit 0 }
     "doctor" { Run-OpenClaw "doctor"; exit 0 }
-    default { Write-Host "Unknown -Action: $Action. Use: gateway-start, gateway-stop, open-chat, status, doctor" -ForegroundColor Yellow; exit 1 }
+    default { Write-Host "Unknown -Action: $Action. Use: minimal-repair, gateway-start, gateway-stop, open-chat, status, doctor" -ForegroundColor Yellow; exit 1 }
   }
 }
 
@@ -1128,7 +1211,7 @@ while ($true) {
       Write-Host ""
       Write-Host "--- 快速配置 ---" -ForegroundColor Yellow
       Write-Host "  [a] 交互式配置 - 完整向导 (openclaw onboard)" -ForegroundColor White
-      Write-Host "  [b] 快速配置 - 选择提供商 + API Key 快速完成" -ForegroundColor White
+      Write-Host "  [b] 快速配置 - 选择提供商 + API Key + 可选安装 Skills" -ForegroundColor White
       Write-Host "  [c] 接入对话渠道 - Telegram / QQ / 飞书 / 钉钉 / Discord" -ForegroundColor White
       Write-Host "  [d] 查看所有渠道状态 - 一键列出各渠道是否已配置" -ForegroundColor White
       Write-Host "  [0]  返回主菜单" -ForegroundColor White
@@ -1255,6 +1338,10 @@ while ($true) {
           }
           Write-Host ("使用默认模型: " + $modelId) -ForegroundColor DarkGray
         }
+        $installSkillsChoice = Read-Host "是否安装官方 Skills 依赖？(Y/n)"
+        $installSkillsChoice = if ($installSkillsChoice) { $installSkillsChoice.Trim().ToLower() } else { "y" }
+        $skipSkills = ($installSkillsChoice -eq "n" -or $installSkillsChoice -eq "no")
+
         $onboardArgs = @(
           "onboard", "--non-interactive",
           "--mode", "local",
@@ -1263,14 +1350,19 @@ while ($true) {
           "--custom-model-id", $modelId,
           "--custom-api-key", $apiKey,
           "--custom-compatibility", $compat,
+          "--node-manager", "npm",
           "--secret-input-mode", "plaintext",
           "--gateway-port", "18789",
           "--gateway-bind", "loopback",
-          "--skip-skills", "--skip-channels", "--skip-daemon",
+          "--skip-channels", "--skip-daemon",
           "--accept-risk"
         )
+        if ($skipSkills) { $onboardArgs += "--skip-skills" }
         Write-Host ""
-        Write-Host "正在执行快速配置 (模型: $modelId)..." -ForegroundColor Cyan
+        $manifestFixed = Ensure-ExtensionManifestCompat
+        if ($manifestFixed.Count -gt 0) { Write-Host "`[预处理`] 已补齐 $($manifestFixed.Count) 个插件 manifest" -ForegroundColor DarkGray }
+        Write-Host "正在执行快速配置 (模型: $modelId，Skills: $(if ($skipSkills) { '跳过' } else { '安装' }))..." -ForegroundColor Cyan
+        $env:OPENCLAW_STATE_DIR = Get-OpenClawConfigDir
         & $OPENCLAW_CMD @onboardArgs
         if ($LASTEXITCODE -eq 0) {
           Write-Host "`[OK`] 完成" -ForegroundColor Green
@@ -1622,6 +1714,8 @@ while ($true) {
         Write-Host "  [d] 代理设置 - 设置 HTTP/HTTPS 代理" -ForegroundColor White
         Write-Host "  [e] 修复 Gateway 任务 - 热迁移/删除源后启动失败时用" -ForegroundColor White
         Write-Host "  [f] 前台启动 Gateway - 计划任务失败时的替代方案，新窗口运行" -ForegroundColor White
+        Write-Host "  [g] Skills 管理 - 检查 / 一键安装或更新官方 Skills" -ForegroundColor White
+        Write-Host "  [h] 一键最小修复 - manifest补齐/配置清理/plugins/skills/gateway 自检（适合小白）" -ForegroundColor White
         Write-Host "  [0]   返回主菜单" -ForegroundColor White
         Write-Host ""
         $toolChoice = Read-Host "请选择"
@@ -1718,6 +1812,43 @@ while ($true) {
           } catch {
             Write-Host "`[提示`] 请手动新开 cmd 运行: openclaw gateway" -ForegroundColor Yellow
           }
+          Pause-Wait
+        } elseif ($toolChoice -eq "g") {
+          Write-Host ""
+          Write-Host "--- Skills 管理 ---" -ForegroundColor Yellow
+          Write-Host "  [1] 列出 Skills (skills list)" -ForegroundColor White
+          Write-Host "  [2] 检查依赖 (skills check)" -ForegroundColor White
+          Write-Host "  [3] 一键安装/更新 Skills (onboard 非交互)" -ForegroundColor White
+          Write-Host "  [0] 返回" -ForegroundColor White
+          Write-Host ""
+          $sk = Read-Host "请选择"
+          $sk = if ($sk) { $sk.Trim() } else { "" }
+          if ($sk -eq "1") {
+            Ensure-ExtensionManifestCompat | Out-Null
+            Run-OpenClaw "skills list" | Out-Null
+          } elseif ($sk -eq "2") {
+            Run-OpenClaw "skills check" | Out-Null
+          } elseif ($sk -eq "3") {
+            Write-Host "`[预处理`] manifest 补齐 + doctor --fix..." -ForegroundColor Cyan
+            Ensure-ExtensionManifestCompat | Out-Null
+            Run-OpenClaw "doctor --fix" 2>$null | Out-Null
+            Write-Host "正在安装/更新 Skills..." -ForegroundColor Cyan
+            $env:OPENCLAW_STATE_DIR = Get-OpenClawConfigDir
+            $errOut = ""
+            try {
+              & $OPENCLAW_CMD onboard --non-interactive --accept-risk --mode local --auth-choice skip --node-manager npm --skip-channels --skip-daemon --skip-health --skip-ui 2>&1 | Tee-Object -Variable errOut | Out-Null
+            } catch { $errOut = $_.Exception.Message }
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "`[OK`] Skills 已更新" -ForegroundColor Green
+              Run-OpenClaw "skills check" | Out-Null
+            } else {
+              Write-Host "`[失败`] Skills 更新失败" -ForegroundColor Red
+              Write-TicketSummary "Skills 安装/更新" $errOut | Out-Null
+            }
+          }
+          Pause-Wait
+        } elseif ($toolChoice -eq "h") {
+          Invoke-MinimalRepair | Out-Null
           Pause-Wait
         } elseif ($toolChoice -eq "d") {
           Write-Host ""

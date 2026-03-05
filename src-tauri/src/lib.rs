@@ -6,7 +6,7 @@ use encoding_rs::GBK;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
@@ -90,6 +90,73 @@ pub struct KeySyncStatus {
     pub env_key_prefix: Option<String>,
     pub auth_profile_key_prefix: Option<String>,
     pub detail: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SelfCheckItem {
+    pub key: String,
+    pub label: String,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SkillMissing {
+    pub bins: Vec<String>,
+    pub any_bins: Vec<String>,
+    pub env: Vec<String>,
+    pub config: Vec<String>,
+    pub os: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SkillCatalogItem {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub bundled: bool,
+    pub eligible: bool,
+    pub missing: SkillMissing,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StartupMigrationResult {
+    pub fixed_count: usize,
+    pub fixed_dirs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillsListResp {
+    skills: Vec<SkillRawItem>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SkillRawMissing {
+    #[serde(default)]
+    bins: Vec<String>,
+    #[serde(default, rename = "anyBins")]
+    any_bins: Vec<String>,
+    #[serde(default)]
+    env: Vec<String>,
+    #[serde(default)]
+    config: Vec<String>,
+    #[serde(default)]
+    os: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillRawItem {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    bundled: bool,
+    #[serde(default)]
+    eligible: bool,
+    #[serde(default)]
+    missing: SkillRawMissing,
 }
 
 #[tauri::command]
@@ -929,6 +996,289 @@ fn save_openclaw_config(openclaw_dir: &str, root: &Value) -> Result<(), String> 
     .map_err(|e| format!("写入 openclaw.json 失败: {}", e))
 }
 
+fn now_stamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    secs.to_string()
+}
+
+fn create_config_snapshot(openclaw_dir: &str, reason: &str) -> Result<String, String> {
+    let reason_norm = reason
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect::<String>();
+    let snapshot_root = Path::new(openclaw_dir).join(".snapshots");
+    std::fs::create_dir_all(&snapshot_root).map_err(|e| format!("创建快照目录失败: {}", e))?;
+    let snapshot_dir = snapshot_root.join(format!("{}-{}", now_stamp(), reason_norm));
+    std::fs::create_dir_all(&snapshot_dir).map_err(|e| format!("创建快照失败: {}", e))?;
+
+    for f in ["openclaw.json", "channels.json", "env"] {
+        let src = Path::new(openclaw_dir).join(f);
+        if src.exists() {
+            let dst = snapshot_dir.join(f);
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+    Ok(snapshot_dir.to_string_lossy().to_string().replace('\\', "/"))
+}
+
+fn list_snapshot_dirs(openclaw_dir: &str) -> Vec<String> {
+    let root = Path::new(openclaw_dir).join(".snapshots");
+    let mut dirs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                dirs.push(p.to_string_lossy().to_string().replace('\\', "/"));
+            }
+        }
+    }
+    dirs.sort_by(|a, b| b.cmp(a));
+    dirs
+}
+
+fn configured_channels_from_files(openclaw_dir: &str) -> Vec<String> {
+    let mut result: BTreeSet<String> = BTreeSet::new();
+    let builtins = ["telegram", "discord", "feishu", "dingtalk", "qq"];
+
+    let root = load_openclaw_config(openclaw_dir).unwrap_or_else(|_| json!({}));
+    if let Some(chs) = root.get("channels").and_then(|v| v.as_object()) {
+        for id in builtins {
+            let ch = chs.get(id).cloned().unwrap_or_else(|| json!({}));
+            if is_channel_configured(id, &ch) {
+                result.insert(id.to_string());
+            }
+        }
+    }
+
+    let channels_path = Path::new(openclaw_dir).join("channels.json");
+    if channels_path.exists() {
+        if let Ok(txt) = std::fs::read_to_string(channels_path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                if let Some(obj) = v.as_object() {
+                    for id in builtins {
+                        let ch = obj.get(id).cloned().unwrap_or_else(|| json!({}));
+                        if is_channel_configured(id, &ch) {
+                            result.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result.into_iter().collect()
+}
+
+fn channel_plugin_package(channel: &str) -> Option<&'static str> {
+    match channel {
+        "discord" => Some("@openclaw/discord"),
+        "feishu" => Some("@openclaw/feishu"),
+        "dingtalk" => Some("@adongguo/openclaw-dingtalk"),
+        "qq" => Some("@sliverp/qqbot"),
+        _ => None,
+    }
+}
+
+fn winget_install_package(pkg_id: &str) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("cmd");
+        hide_console_window(&mut cmd);
+        let out = cmd
+            .args([
+                "/c",
+                "winget",
+                "install",
+                "--id",
+                pkg_id,
+                "-e",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+                "--silent",
+            ])
+            .output()
+            .map_err(|e| format!("执行 winget 失败: {}", e))?;
+        let stdout = decode_console_output(&out.stdout);
+        let stderr = decode_console_output(&out.stderr);
+        if out.status.success() {
+            Ok(format!("winget 安装成功: {}\n{}", pkg_id, stdout))
+        } else {
+            Err(format!("winget 安装失败: {}\n{}\n{}", pkg_id, stdout, stderr))
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pkg_id;
+        Err("当前平台未实现 winget 安装".to_string())
+    }
+}
+
+fn try_fix_missing_bin(bin: &str) -> Result<String, String> {
+    let b = bin.trim().to_lowercase();
+    let pkg = match b.as_str() {
+        "jq" => Some("jqlang.jq"),
+        "rg" => Some("BurntSushi.ripgrep.MSVC"),
+        "ffmpeg" => Some("Gyan.FFmpeg"),
+        _ => None,
+    };
+    if let Some(id) = pkg {
+        return winget_install_package(id);
+    }
+    Err(format!("暂不支持自动安装依赖: {}", bin))
+}
+
+fn ensure_extension_manifest_compat_details(openclaw_dir: &str) -> Result<Vec<String>, String> {
+    let ext_root = Path::new(openclaw_dir).join("extensions");
+    if !ext_root.exists() {
+        return Ok(vec![]);
+    }
+    let mut fixed_dirs: Vec<String> = Vec::new();
+    let entries = std::fs::read_dir(&ext_root).map_err(|e| format!("读取 extensions 目录失败: {}", e))?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let old_manifest = dir.join("clawdbot.plugin.json");
+        let new_manifest = dir.join("openclaw.plugin.json");
+        if old_manifest.exists() && !new_manifest.exists() {
+            std::fs::copy(&old_manifest, &new_manifest)
+                .map_err(|e| format!("补齐 openclaw.plugin.json 失败: {}", e))?;
+            if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+                fixed_dirs.push(name.to_string());
+            } else {
+                fixed_dirs.push(dir.to_string_lossy().to_string().replace('\\', "/"));
+            }
+        }
+    }
+    Ok(fixed_dirs)
+}
+
+fn ensure_extension_manifest_compat(openclaw_dir: &str) -> Result<usize, String> {
+    Ok(ensure_extension_manifest_compat_details(openclaw_dir)?.len())
+}
+
+fn sanitize_invalid_plugin_manifest_refs(openclaw_dir: &str, error_text: &str) -> Result<usize, String> {
+    let re = Regex::new(r"extensions[\\/]+([A-Za-z0-9._-]+)[\\/]")
+        .map_err(|e| format!("正则初始化失败: {}", e))?;
+    let mut plugin_ids: BTreeSet<String> = BTreeSet::new();
+    for cap in re.captures_iter(error_text) {
+        let pid = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if !pid.is_empty() {
+            plugin_ids.insert(pid.to_string());
+        }
+    }
+    if plugin_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut root = load_openclaw_config(openclaw_dir)?;
+    if !root.is_object() {
+        return Ok(0);
+    }
+    let mut changed = 0usize;
+    let obj = root.as_object_mut().expect("config object");
+    let plugins = obj.entry("plugins".to_string()).or_insert_with(|| json!({}));
+    if !plugins.is_object() {
+        *plugins = json!({});
+    }
+    let p_obj = plugins.as_object_mut().expect("plugins object");
+    let entries = p_obj.entry("entries".to_string()).or_insert_with(|| json!({}));
+    if !entries.is_object() {
+        *entries = json!({});
+    }
+    let e_obj = entries.as_object_mut().expect("entries object");
+
+    let keys: Vec<String> = e_obj.keys().cloned().collect();
+    for k in keys {
+        let v = e_obj.get(&k).cloned().unwrap_or_else(|| json!({}));
+        let mut should_remove = false;
+        for pid in &plugin_ids {
+            let pid_lower = pid.to_lowercase();
+            let alias = match pid_lower.as_str() {
+                "openclaw-dingtalk" => Some("dingtalk"),
+                "qqbot" | "openclaw-qq" => Some("qq"),
+                "openclaw-feishu" => Some("feishu"),
+                "openclaw-discord" => Some("discord"),
+                other => Some(other),
+            };
+            if k.eq_ignore_ascii_case(pid)
+                || k.to_lowercase().contains(&pid_lower)
+                || alias.map(|a| k.eq_ignore_ascii_case(a)).unwrap_or(false)
+            {
+                should_remove = true;
+                break;
+            }
+            let text = v.to_string().to_lowercase();
+            if text.contains(&pid_lower) || alias.map(|a| text.contains(a)).unwrap_or(false) {
+                should_remove = true;
+                break;
+            }
+        }
+        if should_remove && e_obj.remove(&k).is_some() {
+            changed += 1;
+        }
+    }
+
+    if let Some(allow) = p_obj.get_mut("allow").and_then(|v| v.as_array_mut()) {
+        let before = allow.len();
+        allow.retain(|x| {
+            let s = x.as_str().unwrap_or("").to_lowercase();
+            !plugin_ids.iter().any(|pid| {
+                let p = pid.to_lowercase();
+                s == p || s.contains(&p)
+            })
+        });
+        changed += before.saturating_sub(allow.len());
+    }
+
+    if changed > 0 {
+        save_openclaw_config(openclaw_dir, &root)?;
+    }
+    Ok(changed)
+}
+
+fn run_skills_list_json_with_repair(
+    exe: &str,
+    openclaw_dir: &str,
+    env_extra: Option<(&str, &str)>,
+) -> Result<String, String> {
+    let _ = ensure_extension_manifest_compat(openclaw_dir);
+    let (ok, out, err) = run_openclaw_cmd_clean(exe, &["skills", "list", "--json"], env_extra)?;
+    if ok {
+        return Ok(out);
+    }
+    let all = format!("{}\n{}", out, err).to_lowercase();
+    let need_fix = all.contains("plugin manifest not found")
+        || all.contains("config invalid")
+        || all.contains("invalid config");
+    if !need_fix {
+        return Err(format!("读取 skills 失败:\n{}\n{}", out, err));
+    }
+
+    let sanitize_changed =
+        sanitize_invalid_plugin_manifest_refs(openclaw_dir, &format!("{}\n{}", out, err)).unwrap_or(0);
+    let (ok2, out2, err2) = run_openclaw_cmd_clean(exe, &["skills", "list", "--json"], env_extra)?;
+    if ok2 {
+        return Ok(out2);
+    }
+
+    let (fix_ok, fix_out, fix_err) = run_openclaw_cmd_clean(exe, &["doctor", "--fix"], env_extra)?;
+    let sanitize_changed2 =
+        sanitize_invalid_plugin_manifest_refs(openclaw_dir, &format!("{}\n{}\n{}\n{}", out2, err2, fix_out, fix_err))
+            .unwrap_or(0);
+    let (ok3, out3, err3) = run_openclaw_cmd_clean(exe, &["skills", "list", "--json"], env_extra)?;
+    if ok3 {
+        return Ok(out3);
+    }
+    Err(format!(
+        "读取 skills 失败（已尝试自动修复）:\n[首次错误]\n{}\n{}\n\n[首次清理]\nremoved_entries={}\n\n[二次错误]\n{}\n{}\n\n[doctor --fix]\n{}\n{}\n(doctor_success={})\n[二次清理]\nremoved_entries={}\n\n[最终错误]\n{}\n{}",
+        out, err, sanitize_changed, out2, err2, fix_out, fix_err, fix_ok, sanitize_changed2, out3, err3
+    ))
+}
+
 /// 在 gateway.cmd 中注入 OPENCLAW_STATE_DIR，确保计划任务启动的 Gateway 使用用户配置目录
 #[tauri::command]
 fn check_config_path_consistency(custom_path: Option<String>) -> Result<serde_json::Value, String> {
@@ -1618,6 +1968,7 @@ fn write_env_config(
 
     std::fs::create_dir_all(&openclaw_dir)
         .map_err(|e| format!("创建目录失败: {}", e))?;
+    let _ = create_config_snapshot(&openclaw_dir, "pre-write-env");
 
     // 优先使用本次输入的 key；若为空则沿用已保存 key（便于只改模型/地址时无需重复输入）
     let provider_for_auth = match provider.as_str() {
@@ -2380,13 +2731,16 @@ fn start_gateway_foreground(custom_path: Option<String>, install_hint: Option<St
         let exe_dir = Path::new(&exe).parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| config_dir.clone());
-        let cmdline = format!(
-            "set OPENCLAW_STATE_DIR={} && \"{}\" gateway",
-            config_win,
-            exe_win
+        let launcher_path = env::temp_dir().join("openclaw-gateway-foreground.cmd");
+        let launcher_content = format!(
+            "@echo off\r\nset \"OPENCLAW_STATE_DIR={}\"\r\ncall \"{}\" gateway\r\n",
+            config_win, exe_win
         );
+        std::fs::write(&launcher_path, launcher_content)
+            .map_err(|e| format!("写入前台启动脚本失败: {}", e))?;
+        let launcher_win = launcher_path.to_string_lossy().to_string().replace('/', "\\");
         let mut cmd = Command::new("cmd");
-        cmd.args(["/c", "start", "", "cmd", "/k", &cmdline]);
+        cmd.args(["/c", "start", "", "cmd", "/k", &launcher_win]);
         cmd.current_dir(&exe_dir);
         cmd.output().map_err(|e| format!("打开新窗口失败: {}", e))?;
         Ok("已在新窗口启动 Gateway，请保持该窗口不关闭。就绪后访问: http://127.0.0.1:18789/".to_string())
@@ -2501,14 +2855,24 @@ fn run_onboard_cli(custom_path: Option<String>, install_hint: Option<String>) ->
 
     #[cfg(target_os = "windows")]
     {
-        let cmdline = format!(
-            "set OPENCLAW_STATE_DIR={} && \"{}\" onboard",
-            config_dir.replace('/', "\\"),
-            exe.replace('/', "\\")
+        let config_win = config_dir.replace('/', "\\");
+        let exe_win = exe.replace('/', "\\");
+        let exe_dir = Path::new(&exe)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| config_dir.clone());
+        let launcher_path = env::temp_dir().join("openclaw-onboard-cli-launcher.cmd");
+        let launcher_content = format!(
+            "@echo off\r\nset \"OPENCLAW_STATE_DIR={}\"\r\ncall \"{}\" onboard\r\n",
+            config_win, exe_win
         );
+        std::fs::write(&launcher_path, launcher_content)
+            .map_err(|e| format!("写入 CLI 启动脚本失败: {}", e))?;
+        let launcher_win = launcher_path.to_string_lossy().to_string().replace('/', "\\");
         let mut cmd = Command::new("cmd");
         // 这里故意不隐藏窗口：用户明确要求打开经典终端界面
-        cmd.args(["/c", "start", "", "cmd", "/k", &cmdline]);
+        cmd.args(["/c", "start", "", "cmd", "/k", &launcher_win]);
+        cmd.current_dir(&exe_dir);
         cmd.output().map_err(|e| format!("打开经典终端失败: {}", e))?;
         return Ok("已打开经典终端配置界面（CLI）。".to_string());
     }
@@ -2683,6 +3047,7 @@ fn save_channel_config(
 ) -> Result<String, String> {
     let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
     std::fs::create_dir_all(&openclaw_dir).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    let _ = create_config_snapshot(&openclaw_dir, "pre-save-channel");
     let config_path = format!("{}/channels.json", openclaw_dir);
 
     let mut effective_config = config;
@@ -3507,6 +3872,734 @@ fn approve_pairing(
     }
 }
 
+#[tauri::command]
+fn list_config_snapshots(custom_path: Option<String>) -> Result<Vec<String>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    Ok(list_snapshot_dirs(&openclaw_dir))
+}
+
+#[tauri::command]
+fn rollback_config_snapshot(snapshot_dir: String, custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let src = PathBuf::from(snapshot_dir.trim().replace('\\', "/"));
+    if !src.exists() || !src.is_dir() {
+        return Err("快照目录不存在".to_string());
+    }
+    let _ = create_config_snapshot(&openclaw_dir, "pre-rollback");
+    let mut restored = Vec::new();
+    for f in ["openclaw.json", "channels.json", "env"] {
+        let s = src.join(f);
+        if s.exists() {
+            let d = Path::new(&openclaw_dir).join(f);
+            std::fs::copy(&s, &d).map_err(|e| format!("恢复 {} 失败: {}", f, e))?;
+            restored.push(f.to_string());
+        }
+    }
+    if restored.is_empty() {
+        return Err("快照目录中没有可恢复文件".to_string());
+    }
+    Ok(format!("已回滚配置：{}", restored.join(", ")))
+}
+
+#[tauri::command]
+fn run_startup_migrations(custom_path: Option<String>) -> Result<StartupMigrationResult, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let fixed_dirs = ensure_extension_manifest_compat_details(&openclaw_dir)?;
+    Ok(StartupMigrationResult {
+        fixed_count: fixed_dirs.len(),
+        fixed_dirs,
+    })
+}
+
+#[tauri::command]
+fn export_diagnostic_bundle(custom_path: Option<String>, install_hint: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let install_hint_norm = install_hint
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(Some(openclaw_dir.as_str())))
+        .unwrap_or_else(|| "openclaw".to_string());
+
+    let out_dir = Path::new(&openclaw_dir).join("diagnostics");
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("创建 diagnostics 目录失败: {}", e))?;
+    let stamp = now_stamp();
+    let report_path = out_dir.join(format!("report-{}.txt", stamp));
+    let zip_path = out_dir.join(format!("diagnostic-{}.zip", stamp));
+
+    let mut report = String::new();
+    report.push_str("=== OpenClaw Deploy Diagnostic ===\n");
+    report.push_str(&format!("time_unix: {}\n", stamp));
+    report.push_str(&format!("config_dir: {}\n", openclaw_dir));
+    report.push_str(&format!("exe: {}\n\n", exe));
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+    for args in [
+        vec!["--version"],
+        vec!["status"],
+        vec!["gateway", "status"],
+        vec!["skills", "check"],
+        vec!["plugins", "list"],
+    ] {
+        let title = format!("$ openclaw {}\n", args.join(" "));
+        report.push_str(&title);
+        match run_openclaw_cmd_clean(&exe, &args, env_extra) {
+            Ok((_ok, out, err)) => {
+                report.push_str(&out);
+                if !err.trim().is_empty() {
+                    report.push('\n');
+                    report.push_str("[stderr]\n");
+                    report.push_str(&err);
+                }
+            }
+            Err(e) => report.push_str(&format!("执行失败: {}", e)),
+        }
+        report.push_str("\n\n");
+    }
+    std::fs::write(&report_path, report).map_err(|e| format!("写入诊断报告失败: {}", e))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut files_to_pack: Vec<String> = Vec::new();
+        for f in ["openclaw.json", "channels.json", "env", "gateway.log"] {
+            let p = Path::new(&openclaw_dir).join(f);
+            if p.exists() {
+                files_to_pack.push(format!("'{}'", p.to_string_lossy().to_string().replace('\'', "''")));
+            }
+        }
+        files_to_pack.push(format!("'{}'", report_path.to_string_lossy().to_string().replace('\'', "''")));
+        let zip_s = zip_path.to_string_lossy().to_string().replace('\'', "''");
+        let sources = files_to_pack.join(",");
+        let script = format!(
+            "$src=@({}); if(Test-Path '{}'){{Remove-Item '{}' -Force}}; Compress-Archive -Path $src -DestinationPath '{}' -Force",
+            sources, zip_s, zip_s, zip_s
+        );
+        let mut cmd = Command::new("powershell");
+        hide_console_window(&mut cmd);
+        let out = cmd.args(["-NoProfile", "-Command", &script]).output().map_err(|e| format!("执行压缩失败: {}", e))?;
+        if !out.status.success() {
+            return Err(format!("压缩失败：{}", decode_console_output(&out.stderr)));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Ok(report_path.to_string_lossy().to_string());
+    }
+    Ok(zip_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn auto_install_channel_plugins(
+    app: tauri::AppHandle,
+    channels: Vec<String>,
+    custom_path: Option<String>,
+    install_hint: Option<String>,
+) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let _ = ensure_extension_manifest_compat(&openclaw_dir);
+    let install_hint_norm = install_hint
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(Some(openclaw_dir.as_str())))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+
+    let mut installed = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
+    let total = channels.len().max(1);
+    let mut current = 0usize;
+
+    let emit_progress = |channel: &str, status: &str, message: &str, current_idx: usize| {
+        let _ = app.emit(
+            "plugin-install-progress",
+            json!({
+                "channel": channel,
+                "status": status,
+                "message": message,
+                "current": current_idx,
+                "total": total
+            }),
+        );
+    };
+
+    for ch in channels {
+        let id = ch.trim().to_lowercase();
+        current += 1;
+        emit_progress(&id, "running", "开始处理渠道插件", current);
+        let Some(pkg) = channel_plugin_package(&id) else {
+            skipped.push(format!("{}(内置或无需插件)", id));
+            emit_progress(&id, "skipped", "内置渠道或无需插件，已跳过", current);
+            continue;
+        };
+
+        let (list_ok_before, list_out_before, list_err_before) =
+            run_openclaw_cmd_clean(&exe, &["plugins", "list"], env_extra)?;
+        let list_before = format!("{}\n{}", list_out_before, list_err_before).to_lowercase();
+        let pkg_short = pkg.split('/').last().unwrap_or(pkg).to_lowercase();
+        if list_ok_before
+            && (list_before.contains(&pkg.to_lowercase()) || list_before.contains(&pkg_short))
+        {
+            skipped.push(format!("{} -> {} (已安装)", id, pkg));
+            emit_progress(&id, "skipped", &format!("{} 已安装，跳过", pkg), current);
+            continue;
+        }
+
+        emit_progress(&id, "running", &format!("正在安装 {}", pkg), current);
+        let (ok, out, err) = run_openclaw_cmd_clean(
+            &exe,
+            &["plugins", "install", &format!("{}@latest", pkg)],
+            env_extra,
+        )?;
+        let lower = format!("{}\n{}", out, err).to_lowercase();
+        let duplicate_warn = lower.contains("duplicate plugin id");
+        if ok || duplicate_warn {
+            installed.push(format!("{} -> {}", id, pkg));
+            if duplicate_warn {
+                emit_progress(&id, "done", "安装完成（检测到重复插件ID警告，已按已安装处理）", current);
+            } else {
+                emit_progress(&id, "done", "安装完成", current);
+            }
+        } else {
+            failed.push(format!("{} -> {}\n{}\n{}", id, pkg, out, err));
+            emit_progress(&id, "error", "安装失败，请查看详情日志", current);
+        }
+    }
+
+    let (list_ok, list_out, list_err) = run_openclaw_cmd_clean(&exe, &["plugins", "list"], env_extra)?;
+    let verify_text = if list_ok { list_out } else { format!("{}\n{}", list_out, list_err) };
+
+    let mut msg = String::new();
+    if !installed.is_empty() {
+        msg.push_str(&format!("已安装:\n{}\n\n", installed.join("\n")));
+    }
+    if !skipped.is_empty() {
+        msg.push_str(&format!("已跳过:\n{}\n\n", skipped.join("\n")));
+    }
+    if !failed.is_empty() {
+        msg.push_str(&format!("安装失败:\n{}\n\n", failed.join("\n\n")));
+    }
+    msg.push_str("插件列表校验:\n");
+    msg.push_str(&verify_text);
+    if let Ok(n) = ensure_extension_manifest_compat(&openclaw_dir) {
+        if n > 0 {
+            msg.push_str(&format!("\n\n已自动补齐插件清单文件: {} 项", n));
+        }
+    }
+    let _ = app.emit(
+        "plugin-install-progress",
+        json!({
+            "channel": "summary",
+            "status": "done",
+            "message": "插件处理完成",
+            "current": total,
+            "total": total
+        }),
+    );
+    Ok(msg)
+}
+
+#[tauri::command]
+fn list_skills_catalog(custom_path: Option<String>, install_hint: Option<String>) -> Result<Vec<SkillCatalogItem>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let install_hint_norm = install_hint
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(Some(openclaw_dir.as_str())))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+    let out = run_skills_list_json_with_repair(&exe, &openclaw_dir, env_extra)?;
+    let parsed: SkillsListResp =
+        serde_json::from_str(&out).map_err(|e| format!("解析 skills JSON 失败: {}\n{}", e, out))?;
+    let mut items: Vec<SkillCatalogItem> = parsed
+        .skills
+        .into_iter()
+        .map(|s| SkillCatalogItem {
+            name: s.name,
+            description: s.description.trim().to_string(),
+            source: s.source,
+            bundled: s.bundled,
+            eligible: s.eligible,
+            missing: SkillMissing {
+                bins: s.missing.bins,
+                any_bins: s.missing.any_bins,
+                env: s.missing.env,
+                config: s.missing.config,
+                os: s.missing.os,
+            },
+        })
+        .collect();
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(items)
+}
+
+#[tauri::command]
+fn repair_selected_skills(
+    app: tauri::AppHandle,
+    skill_names: Vec<String>,
+    custom_path: Option<String>,
+    install_hint: Option<String>,
+) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let install_hint_norm = install_hint
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(Some(openclaw_dir.as_str())))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+
+    let catalog = list_skills_catalog(Some(openclaw_dir.clone()), install_hint.clone())?;
+    let selected: Vec<SkillCatalogItem> = catalog
+        .into_iter()
+        .filter(|s| skill_names.iter().any(|n| n.eq_ignore_ascii_case(&s.name)))
+        .collect();
+    let total = selected.len().max(1);
+    let mut idx = 0usize;
+    let mut logs: Vec<String> = Vec::new();
+    let mut need_plugin_channels: BTreeSet<String> = BTreeSet::new();
+
+    for s in selected {
+        idx += 1;
+        let _ = app.emit(
+            "skills-repair-progress",
+            json!({"skill": s.name, "status": "running", "current": idx, "total": total, "message": "分析缺失依赖"}),
+        );
+        if s.missing.bins.is_empty()
+            && s.missing.any_bins.is_empty()
+            && s.missing.env.is_empty()
+            && s.missing.config.is_empty()
+            && s.missing.os.is_empty()
+        {
+            logs.push(format!("{}: 无缺失依赖", s.name));
+            let _ = app.emit(
+                "skills-repair-progress",
+                json!({"skill": s.name, "status": "done", "current": idx, "total": total, "message": "无缺失依赖"}),
+            );
+            continue;
+        }
+
+        for b in &s.missing.bins {
+            match try_fix_missing_bin(b) {
+                Ok(msg) => logs.push(format!("{} -> {}: {}", s.name, b, msg)),
+                Err(e) => logs.push(format!("{} -> {}: {}", s.name, b, e)),
+            }
+        }
+        if !s.missing.any_bins.is_empty() {
+            let mut fixed_any = false;
+            for b in &s.missing.any_bins {
+                if let Ok(msg) = try_fix_missing_bin(b) {
+                    logs.push(format!("{} -> any({}): {}", s.name, b, msg));
+                    fixed_any = true;
+                    break;
+                }
+            }
+            if !fixed_any {
+                logs.push(format!(
+                    "{}: anyBins 无法自动安装，请手动安装其一：{}",
+                    s.name,
+                    s.missing.any_bins.join(", ")
+                ));
+            }
+        }
+
+        for c in &s.missing.config {
+            let lower = c.to_lowercase();
+            if lower.contains("channels.discord") {
+                need_plugin_channels.insert("discord".to_string());
+            } else if lower.contains("channels.feishu") {
+                need_plugin_channels.insert("feishu".to_string());
+            } else if lower.contains("channels.dingtalk") {
+                need_plugin_channels.insert("dingtalk".to_string());
+            } else if lower.contains("channels.qq") {
+                need_plugin_channels.insert("qq".to_string());
+            }
+            logs.push(format!("{}: 缺少配置 {}", s.name, c));
+        }
+        for e in &s.missing.env {
+            logs.push(format!("{}: 缺少环境变量 {}（需手动填写真实值）", s.name, e));
+        }
+        for os in &s.missing.os {
+            logs.push(format!("{}: 受限平台 {}", s.name, os));
+        }
+        let _ = app.emit(
+            "skills-repair-progress",
+            json!({"skill": s.name, "status": "done", "current": idx, "total": total, "message": "修复流程已执行"}),
+        );
+    }
+
+    if !need_plugin_channels.is_empty() {
+        let channels: Vec<String> = need_plugin_channels.into_iter().collect();
+        let _ = app.emit(
+            "skills-repair-progress",
+            json!({"skill": "plugins", "status": "running", "current": total, "total": total, "message": "正在补齐渠道插件"}),
+        );
+        let plugin_result = auto_install_channel_plugins(app.clone(), channels, Some(openclaw_dir.clone()), install_hint.clone())?;
+        logs.push(format!("[渠道插件修复]\n{}", plugin_result));
+    }
+
+    let (ck_ok, ck_out, ck_err) = run_openclaw_cmd_clean(&exe, &["skills", "check"], env_extra)?;
+    logs.push("[skills check]".to_string());
+    logs.push(ck_out);
+    if !ck_ok && !ck_err.trim().is_empty() {
+        logs.push(ck_err);
+    }
+    let _ = app.emit(
+        "skills-repair-progress",
+        json!({"skill": "summary", "status": "done", "current": total, "total": total, "message": "全部处理完成"}),
+    );
+    Ok(logs.join("\n"))
+}
+
+#[tauri::command]
+fn skills_manage(
+    action: String,
+    custom_path: Option<String>,
+    install_hint: Option<String>,
+) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let install_hint_norm = install_hint
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(Some(openclaw_dir.as_str())))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+    let act = action.trim().to_lowercase();
+
+    if act == "list" {
+        let (ok1, out1, err1) = run_openclaw_cmd_clean(&exe, &["skills", "list"], env_extra)?;
+        let (ok2, out2, err2) = run_openclaw_cmd_clean(&exe, &["skills", "check"], env_extra)?;
+        let mut msg = String::new();
+        msg.push_str("=== 已安装/可用 Skills ===\n");
+        msg.push_str(&out1);
+        if !ok1 && !err1.trim().is_empty() {
+            msg.push_str("\n[skills list stderr]\n");
+            msg.push_str(&err1);
+        }
+        msg.push_str("\n\n=== 依赖检查 ===\n");
+        msg.push_str(&out2);
+        if !ok2 && !err2.trim().is_empty() {
+            msg.push_str("\n[skills check stderr]\n");
+            msg.push_str(&err2);
+        }
+        return Ok(msg);
+    }
+
+    let verb = match act.as_str() {
+        "install" => "安装",
+        "update" => "更新",
+        "reinstall" => "重装",
+        _ => "执行",
+    };
+    let _ = create_config_snapshot(&openclaw_dir, "pre-skills-manage");
+    let onboard_args = [
+        "onboard",
+        "--non-interactive",
+        "--accept-risk",
+        "--mode",
+        "local",
+        "--auth-choice",
+        "skip",
+        "--node-manager",
+        "npm",
+        "--skip-channels",
+        "--skip-daemon",
+        "--skip-health",
+        "--skip-ui",
+    ];
+    let (ok, out, err) = run_openclaw_cmd_clean(&exe, &onboard_args, env_extra)?;
+    let (ck_ok, ck_out, ck_err) = run_openclaw_cmd_clean(&exe, &["skills", "check"], env_extra)?;
+    let mut msg = format!("Skills {}结果: {}\n\n", verb, if ok { "成功" } else { "失败" });
+    msg.push_str("[onboard 输出]\n");
+    msg.push_str(&out);
+    if !err.trim().is_empty() {
+        msg.push_str("\n[onboard 错误]\n");
+        msg.push_str(&err);
+    }
+    msg.push_str("\n\n[skills check]\n");
+    msg.push_str(&ck_out);
+    if !ck_ok && !ck_err.trim().is_empty() {
+        msg.push_str("\n[skills check 错误]\n");
+        msg.push_str(&ck_err);
+    }
+    Ok(msg)
+}
+
+#[tauri::command]
+fn run_self_check(custom_path: Option<String>, install_hint: Option<String>) -> Result<Vec<SelfCheckItem>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let install_hint_norm = install_hint
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(Some(openclaw_dir.as_str())))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+    let mut items: Vec<SelfCheckItem> = Vec::new();
+
+    let (g_ok, g_out, g_err) = run_openclaw_cmd_clean(&exe, &["gateway", "status"], env_extra)?;
+    let g_text = format!("{}\n{}", g_out, g_err).to_lowercase();
+    let gateway_healthy = g_text.contains("rpc probe: ok")
+        || g_text.contains("listening:")
+        || g_text.contains("service: scheduled task (registered)")
+        || g_text.contains("running")
+        || g_text.contains("online");
+    let gateway_status = if g_ok && gateway_healthy {
+        "ok"
+    } else if g_ok {
+        "warn"
+    } else {
+        "error"
+    };
+    items.push(SelfCheckItem {
+        key: "gateway".to_string(),
+        label: "Gateway".to_string(),
+        status: gateway_status.to_string(),
+        detail: format!("{}\n{}", g_out, g_err).trim().to_string(),
+    });
+
+    let model_res = probe_runtime_model_connection(Some(openclaw_dir.clone()))
+        .unwrap_or_else(|e| format!("探活失败: {}", e));
+    let model_status = if model_res.contains("通过") {
+        "ok"
+    } else if model_res.contains("失败") || model_res.contains("error") {
+        "error"
+    } else {
+        "warn"
+    };
+    items.push(SelfCheckItem {
+        key: "model".to_string(),
+        label: "模型连通".to_string(),
+        status: model_status.to_string(),
+        detail: model_res,
+    });
+
+    let configured_channels = configured_channels_from_files(&openclaw_dir);
+    let (p_ok, p_out, p_err) = run_openclaw_cmd_clean(&exe, &["plugins", "list"], env_extra)?;
+    let p_all = format!("{}\n{}", p_out, p_err).to_lowercase();
+    let mut missing: Vec<String> = Vec::new();
+    for ch in &configured_channels {
+        if let Some(pkg) = channel_plugin_package(ch) {
+            if !p_all.contains(&pkg.to_lowercase()) {
+                missing.push(format!("{}({})", ch, pkg));
+            }
+        }
+    }
+    let plugin_status = if !p_ok {
+        "warn"
+    } else if missing.is_empty() {
+        "ok"
+    } else {
+        "error"
+    };
+    let plugin_detail = if !p_ok {
+        format!("插件列表读取失败：{}\n{}", p_out, p_err)
+    } else if missing.is_empty() {
+        "渠道插件完整".to_string()
+    } else {
+        format!("缺少插件：{}", missing.join(", "))
+    };
+    items.push(SelfCheckItem {
+        key: "plugins".to_string(),
+        label: "渠道插件".to_string(),
+        status: plugin_status.to_string(),
+        detail: plugin_detail,
+    });
+
+    #[cfg(target_os = "windows")]
+    let port_info = {
+        let mut cmd = Command::new("powershell");
+        hide_console_window(&mut cmd);
+        let out = cmd.args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetTCPConnection -LocalPort 18789 -ErrorAction SilentlyContinue | Select-Object -First 1 -Property State,OwningProcess | ConvertTo-Json -Compress",
+        ]).output();
+        match out {
+            Ok(o) => {
+                let txt = decode_console_output(&o.stdout);
+                if txt.trim().is_empty() {
+                    ("warn".to_string(), "端口 18789 未监听".to_string())
+                } else {
+                    ("ok".to_string(), format!("端口 18789 已监听: {}", txt.trim()))
+                }
+            }
+            Err(e) => ("warn".to_string(), format!("端口检测失败: {}", e)),
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let port_info = ("unknown".to_string(), "当前平台未实现端口检测".to_string());
+    items.push(SelfCheckItem {
+        key: "port".to_string(),
+        label: "端口占用".to_string(),
+        status: port_info.0,
+        detail: port_info.1,
+    });
+
+    let consistency = check_config_path_consistency(Some(openclaw_dir.clone()))?;
+    let consistent = consistency
+        .get("consistent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let suggestion = consistency
+        .get("suggestion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    items.push(SelfCheckItem {
+        key: "config".to_string(),
+        label: "配置路径一致性".to_string(),
+        status: if consistent { "ok".to_string() } else { "error".to_string() },
+        detail: if suggestion.is_empty() {
+            "配置路径一致".to_string()
+        } else {
+            suggestion.to_string()
+        },
+    });
+    Ok(items)
+}
+
+#[tauri::command]
+fn run_minimal_repair(
+    custom_path: Option<String>,
+    install_hint: Option<String>,
+) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let install_hint_norm = install_hint
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(Some(openclaw_dir.as_str())))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+
+    let mut logs: Vec<String> = Vec::new();
+    logs.push(format!("配置目录: {}", openclaw_dir));
+
+    // 1) manifest 补齐
+    match ensure_extension_manifest_compat_details(&openclaw_dir) {
+        Ok(fixed) => logs.push(format!(
+            "manifest补齐: {}",
+            if fixed.is_empty() {
+                "无变更".to_string()
+            } else {
+                format!("已修复 {} 项 [{}]", fixed.len(), fixed.join(", "))
+            }
+        )),
+        Err(e) => logs.push(format!("manifest补齐失败: {}", e)),
+    }
+
+    // 2) 配置清理（针对插件残留）
+    let mut clean_removed = 0usize;
+    if let Ok((ok, out, err)) = run_openclaw_cmd_clean(&exe, &["skills", "list", "--json"], env_extra) {
+        if !ok {
+            clean_removed = sanitize_invalid_plugin_manifest_refs(&openclaw_dir, &format!("{}\n{}", out, err))
+                .unwrap_or(0);
+        }
+    }
+    logs.push(format!("配置清理: removed_entries={}", clean_removed));
+
+    // 3) plugins 校验
+    let (p_ok, p_out, p_err) = run_openclaw_cmd_clean(&exe, &["plugins", "list"], env_extra)?;
+    logs.push(format!("plugins校验: {}", if p_ok { "ok" } else { "error" }));
+    if !p_ok && !p_err.trim().is_empty() {
+        logs.push(format!("plugins错误: {}", p_err.trim()));
+    }
+    if p_ok && !p_out.trim().is_empty() {
+        logs.push(format!("plugins摘要: {}", p_out.lines().next().unwrap_or("ok")));
+    }
+
+    // 4) skills check
+    let (s_ok, s_out, s_err) = run_openclaw_cmd_clean(&exe, &["skills", "check"], env_extra)?;
+    logs.push(format!("skills check: {}", if s_ok { "ok" } else { "error" }));
+    if !s_err.trim().is_empty() {
+        logs.push(format!("skills错误: {}", s_err.trim()));
+    } else if !s_out.trim().is_empty() {
+        logs.push(format!("skills摘要: {}", s_out.lines().next().unwrap_or("ok")));
+    }
+
+    // 5) gateway 自检
+    let self_check = run_self_check(Some(openclaw_dir.clone()), install_hint.clone())?;
+    let mut bad = Vec::new();
+    for item in &self_check {
+        if item.status != "ok" {
+            bad.push(format!("{}={}", item.key, item.status));
+        }
+    }
+    logs.push(format!(
+        "gateway自检: {}",
+        if bad.is_empty() {
+            "全部正常".to_string()
+        } else {
+            format!("存在异常 [{}]", bad.join(", "))
+        }
+    ));
+
+    Ok(logs.join("\n"))
+}
+
+#[tauri::command]
+fn fix_self_check_item(
+    key: String,
+    custom_path: Option<String>,
+    install_hint: Option<String>,
+) -> Result<String, String> {
+    let k = key.trim().to_lowercase();
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let install_hint_norm = install_hint
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(Some(openclaw_dir.as_str())))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+
+    match k.as_str() {
+        "gateway" => start_gateway(Some(openclaw_dir.clone()), install_hint.clone()),
+        "model" => probe_runtime_model_connection(Some(openclaw_dir.clone())),
+        "plugins" => {
+            let channels = configured_channels_from_files(&openclaw_dir);
+            let mut installed = Vec::new();
+            let mut skipped = Vec::new();
+            for ch in channels {
+                let id = ch.trim().to_lowercase();
+                let Some(pkg) = channel_plugin_package(&id) else {
+                    skipped.push(format!("{}(内置或无需插件)", id));
+                    continue;
+                };
+                let (ok, out, err) = run_openclaw_cmd_clean(
+                    &exe,
+                    &["plugins", "install", &format!("{}@latest", pkg)],
+                    env_extra,
+                )?;
+                let lower = format!("{}\n{}", out, err).to_lowercase();
+                if ok || lower.contains("duplicate plugin id") {
+                    installed.push(format!("{} -> {}", id, pkg));
+                } else {
+                    return Err(format!("插件修复失败: {}\n{}\n{}", pkg, out, err));
+                }
+            }
+            Ok(format!(
+                "插件修复完成\n已安装/处理:\n{}\n\n已跳过:\n{}",
+                if installed.is_empty() { "(无)".to_string() } else { installed.join("\n") },
+                if skipped.is_empty() { "(无)".to_string() } else { skipped.join("\n") }
+            ))
+        }
+        "port" => {
+            let _ = run_openclaw_cmd_clean(&exe, &["gateway", "stop"], env_extra);
+            thread::sleep(Duration::from_secs(2));
+            start_gateway(Some(openclaw_dir.clone()), install_hint.clone())
+        }
+        "config" => {
+            patch_gateway_cmd_state_dir(&openclaw_dir);
+            let _ = run_openclaw_cmd_clean(&exe, &["gateway", "install", "--force"], env_extra);
+            Ok("已尝试修复配置路径并重装 Gateway 任务".to_string())
+        }
+        _ => Err("未知修复项".to_string()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3562,6 +4655,17 @@ pub fn run() {
             add_npm_to_path,
             check_config_path_consistency,
             detect_openclaw_config_path,
+            run_self_check,
+            run_minimal_repair,
+            fix_self_check_item,
+            auto_install_channel_plugins,
+            skills_manage,
+            export_diagnostic_bundle,
+            list_config_snapshots,
+            rollback_config_snapshot,
+            list_skills_catalog,
+            repair_selected_skills,
+            run_startup_migrations,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

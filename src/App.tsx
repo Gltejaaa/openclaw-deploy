@@ -81,6 +81,64 @@ interface KeySyncStatus {
   detail: string;
 }
 
+interface SelfCheckItem {
+  key: string;
+  label: string;
+  status: "ok" | "warn" | "error" | "unknown" | string;
+  detail: string;
+}
+
+interface PluginInstallProgressEvent {
+  channel: string;
+  status: "running" | "done" | "error" | "skipped" | string;
+  message: string;
+  current: number;
+  total: number;
+}
+
+interface SkillMissing {
+  bins: string[];
+  any_bins: string[];
+  env: string[];
+  config: string[];
+  os: string[];
+}
+
+interface SkillCatalogItem {
+  name: string;
+  description: string;
+  source: string;
+  bundled: boolean;
+  eligible: boolean;
+  missing: SkillMissing;
+}
+
+interface SkillsRepairProgressEvent {
+  skill: string;
+  status: string;
+  current: number;
+  total: number;
+  message: string;
+}
+
+interface StartupMigrationResult {
+  fixed_count: number;
+  fixed_dirs: string[];
+}
+
+type QueueTaskStatus = "queued" | "running" | "done" | "error" | "cancelled";
+interface QueueTaskItem {
+  id: string;
+  name: string;
+  status: QueueTaskStatus;
+  retryCount: number;
+  maxRetries: number;
+  createdAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  error?: string;
+}
+
 type HealthState = "ok" | "warn" | "error" | "unknown";
 
 type InstallStepStatus = "pending" | "running" | "done" | "error";
@@ -102,6 +160,27 @@ const INSTALL_STEPS: InstallStepItem[] = [
 
 function stripAnsi(input: string): string {
   return input.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
+function clampLogText(input: string, maxChars = 12000): string {
+  if (!input) return input;
+  if (input.length <= maxChars) return input;
+  return `${input.slice(0, maxChars)}\n\n...(日志过长，已截断 ${input.length - maxChars} 字符)`;
+}
+
+function makeTicketSummary(action: string, error: unknown, extra?: string): string {
+  const msg = String(error ?? "unknown");
+  const firstLine = msg.split(/\r?\n/)[0] || msg;
+  const ts = new Date().toISOString();
+  return [
+    `时间: ${ts}`,
+    `操作: ${action}`,
+    `错误摘要: ${firstLine}`,
+    extra ? `上下文: ${extra}` : "",
+    "建议: 点击“最小修复”后重试；若仍失败请附上完整日志与截图。",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function normalizeConfigPath(input: string): string {
@@ -280,6 +359,40 @@ function App() {
   const [localInfo, setLocalInfo] = useState<LocalOpenclawInfo | null>(null);
   const [exeCheckInfo, setExeCheckInfo] = useState<ExecutableCheckInfo | null>(null);
   const [uninstalling, setUninstalling] = useState(false);
+  const [onboardCliLoading, setOnboardCliLoading] = useState(false);
+  const [selfCheckLoading, setSelfCheckLoading] = useState(false);
+  const [selfCheckItems, setSelfCheckItems] = useState<SelfCheckItem[]>([]);
+  const [selfCheckFixingKey, setSelfCheckFixingKey] = useState<string | null>(null);
+  const [selfCheckResult, setSelfCheckResult] = useState<string | null>(null);
+  const [pluginSelection, setPluginSelection] = useState<Record<string, boolean>>({
+    telegram: true,
+    qq: true,
+    feishu: true,
+    discord: true,
+    dingtalk: true,
+  });
+  const [pluginInstallLoading, setPluginInstallLoading] = useState(false);
+  const [pluginInstallResult, setPluginInstallResult] = useState<string | null>(null);
+  const [pluginInstallProgress, setPluginInstallProgress] = useState<PluginInstallProgressEvent | null>(null);
+  const [pluginInstallProgressLog, setPluginInstallProgressLog] = useState<string[]>([]);
+  const [skillsLoading, setSkillsLoading] = useState(false);
+  const [skillsResult, setSkillsResult] = useState<string | null>(null);
+  const [skillsCatalogLoading, setSkillsCatalogLoading] = useState(false);
+  const [skillsCatalog, setSkillsCatalog] = useState<SkillCatalogItem[]>([]);
+  const [selectedSkills, setSelectedSkills] = useState<Record<string, boolean>>({});
+  const [skillsRepairLoading, setSkillsRepairLoading] = useState(false);
+  const [skillsRepairProgress, setSkillsRepairProgress] = useState<SkillsRepairProgressEvent | null>(null);
+  const [skillsRepairProgressLog, setSkillsRepairProgressLog] = useState<string[]>([]);
+  const [diagnosticLoading, setDiagnosticLoading] = useState(false);
+  const [diagnosticResult, setDiagnosticResult] = useState<string | null>(null);
+  const [snapshotsLoading, setSnapshotsLoading] = useState(false);
+  const [snapshots, setSnapshots] = useState<string[]>([]);
+  const [rollingBackSnapshot, setRollingBackSnapshot] = useState<string | null>(null);
+  const [startupMigrationResult, setStartupMigrationResult] = useState<StartupMigrationResult | null>(null);
+  const [queueTasks, setQueueTasks] = useState<QueueTaskItem[]>([]);
+  const queueRunnersRef = useRef<Record<string, () => Promise<void>>>({});
+  const cancelledRunningTasksRef = useRef<Set<string>>(new Set());
+  const [ticketSummary, setTicketSummary] = useState<string | null>(null);
 
   const [fixing, setFixing] = useState<"node" | "npm" | "git" | "openclaw" | null>(null);
   const [fixResult, setFixResult] = useState<string | null>(null);
@@ -291,6 +404,15 @@ function App() {
   const configReloadTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
+    invoke<StartupMigrationResult>("run_startup_migrations", {
+      customPath: normalizeConfigPath(localStorage.getItem("openclaw_config_dir") || "") || undefined,
+    })
+      .then((res) => {
+        if (res && res.fixed_count > 0) {
+          setStartupMigrationResult(res);
+        }
+      })
+      .catch(() => {});
     const savedInstall = localStorage.getItem("openclaw_install_dir") ?? "";
     const savedConfig = localStorage.getItem("openclaw_config_dir") ?? "";
     if (savedInstall) setCustomInstallPath(savedInstall);
@@ -313,6 +435,106 @@ function App() {
     }
     runEnvCheck(savedInstall || undefined);
   }, []);
+
+  const enqueueTask = (
+    name: string,
+    runner: () => Promise<void>,
+    options?: { maxRetries?: number }
+  ) => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    queueRunnersRef.current[id] = runner;
+    setQueueTasks((prev) => [
+      ...prev,
+      {
+        id,
+        name,
+        status: "queued",
+        retryCount: 0,
+        maxRetries: options?.maxRetries ?? 1,
+        createdAt: Date.now(),
+      },
+    ]);
+    return id;
+  };
+
+  const cancelTask = (id: string) => {
+    setQueueTasks((prev) =>
+      prev.map((t) => {
+        if (t.id !== id) return t;
+        if (t.status === "queued") return { ...t, status: "cancelled", finishedAt: Date.now() };
+        if (t.status === "running") {
+          cancelledRunningTasksRef.current.add(id);
+          return { ...t, status: "cancelled", finishedAt: Date.now() };
+        }
+        return t;
+      })
+    );
+  };
+
+  const retryTask = (id: string) => {
+    setQueueTasks((prev) =>
+      prev.map((t) => {
+        if (t.id !== id) return t;
+        if (t.retryCount >= t.maxRetries) return t;
+        return {
+          ...t,
+          status: "queued",
+          retryCount: t.retryCount + 1,
+          error: undefined,
+          finishedAt: undefined,
+          startedAt: undefined,
+        };
+      })
+    );
+  };
+
+  useEffect(() => {
+    const running = queueTasks.find((t) => t.status === "running");
+    if (running) return;
+    const next = queueTasks.find((t) => t.status === "queued");
+    if (!next) return;
+    const run = queueRunnersRef.current[next.id];
+    if (!run) {
+      setQueueTasks((prev) =>
+        prev.map((t) =>
+          t.id === next.id ? { ...t, status: "error", error: "任务执行器丢失", finishedAt: Date.now() } : t
+        )
+      );
+      return;
+    }
+
+    setQueueTasks((prev) =>
+      prev.map((t) => (t.id === next.id ? { ...t, status: "running", startedAt: Date.now() } : t))
+    );
+
+    Promise.resolve()
+      .then(() => run())
+      .then(() => {
+        if (cancelledRunningTasksRef.current.has(next.id)) {
+          cancelledRunningTasksRef.current.delete(next.id);
+          return;
+        }
+        setQueueTasks((prev) =>
+          prev.map((t) => (t.id === next.id ? { ...t, status: "done", finishedAt: Date.now() } : t))
+        );
+      })
+      .catch((e) => {
+        if (cancelledRunningTasksRef.current.has(next.id)) {
+          cancelledRunningTasksRef.current.delete(next.id);
+          return;
+        }
+        setQueueTasks((prev) =>
+          prev.map((t) =>
+            t.id === next.id
+              ? { ...t, status: "error", error: String(e), finishedAt: Date.now() }
+              : t
+          )
+        );
+      })
+      .finally(() => {
+        delete queueRunnersRef.current[next.id];
+      });
+  }, [queueTasks]);
 
   useEffect(() => {
     if (customInstallPath.trim()) {
@@ -375,7 +597,7 @@ function App() {
     }
     if (step >= 3 && !loadedStepDataRef.current.channel) {
       loadedStepDataRef.current.channel = true;
-      void loadSavedChannels(cfgPath);
+      void Promise.all([loadSavedChannels(cfgPath), loadSnapshots()]);
     }
   }, [step]);
 
@@ -1153,6 +1375,264 @@ function App() {
     }
   };
 
+  const handleOpenSkillsOnboard = async () => {
+    if (onboardCliLoading) return;
+    setOnboardCliLoading(true);
+    setStartResult(null);
+    const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+    try {
+      const result = await invoke<string>("run_onboard_cli", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+        installHint,
+      });
+      setStartResult(stripAnsi(`${result}\n提示：在打开的终端里选择安装 Skills，即可一键补齐能力。`));
+    } catch (e) {
+      setStartResult(stripAnsi(`打开 Skills 安装向导失败: ${e}`));
+    } finally {
+      setOnboardCliLoading(false);
+    }
+  };
+
+  const runSelfCheck = async () => {
+    enqueueTask("自检总控", async () => {
+      if (selfCheckLoading) return;
+      setSelfCheckLoading(true);
+      setSelfCheckResult(null);
+      try {
+        const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+        const items = await invoke<SelfCheckItem[]>("run_self_check", {
+          customPath: normalizeConfigPath(customConfigPath) || undefined,
+          installHint,
+        });
+        setSelfCheckItems(items || []);
+        setSelfCheckResult("自检完成");
+      } catch (e) {
+        setSelfCheckResult(`自检失败: ${e}`);
+        setTicketSummary(makeTicketSummary("自检总控", e, "run_self_check"));
+        throw e;
+      } finally {
+        setSelfCheckLoading(false);
+      }
+    });
+  };
+
+  const handleFixSelfCheck = async (key: string) => {
+    if (selfCheckFixingKey) return;
+    setSelfCheckFixingKey(key);
+    setSelfCheckResult(null);
+    try {
+      const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+      const result = await invoke<string>("fix_self_check_item", {
+        key,
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+        installHint,
+      });
+      setSelfCheckResult(result);
+      await runSelfCheck();
+    } catch (e) {
+      setSelfCheckResult(`修复失败: ${e}`);
+    } finally {
+      setSelfCheckFixingKey(null);
+    }
+  };
+
+  const handleMinimalRepair = async () => {
+    enqueueTask("一键最小修复", async () => {
+      setSelfCheckResult(null);
+      try {
+        const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+        const result = await invoke<string>("run_minimal_repair", {
+          customPath: normalizeConfigPath(customConfigPath) || undefined,
+          installHint,
+        });
+        setSelfCheckResult(clampLogText(`最小修复完成\n${result}`));
+        await runSelfCheck();
+      } catch (e) {
+        setSelfCheckResult(`最小修复失败: ${e}`);
+        setTicketSummary(makeTicketSummary("一键最小修复", e, "run_minimal_repair"));
+        throw e;
+      }
+    });
+  };
+
+  const handleAutoInstallPlugins = async () => {
+    enqueueTask("渠道插件自动安装", async () => {
+      if (pluginInstallLoading) return;
+      setPluginInstallLoading(true);
+      setPluginInstallResult(null);
+      setPluginInstallProgress(null);
+      setPluginInstallProgressLog([]);
+      const unlisten = await listen<PluginInstallProgressEvent>("plugin-install-progress", (e) => {
+        const payload = e.payload;
+        if (!payload) return;
+        setPluginInstallProgress(payload);
+        setPluginInstallProgressLog((prev) => {
+          const line = `[${payload.current}/${payload.total}] ${payload.channel}: ${payload.message}`;
+          const next = [...prev, line];
+          return next.length > 80 ? next.slice(-80) : next;
+        });
+      });
+      try {
+        const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+        const selectedChannels = Object.keys(pluginSelection).filter((k) => pluginSelection[k]);
+        const result = await invoke<string>("auto_install_channel_plugins", {
+          channels: selectedChannels,
+          customPath: normalizeConfigPath(customConfigPath) || undefined,
+          installHint,
+        });
+        setPluginInstallResult(clampLogText(result));
+      } catch (e) {
+        setPluginInstallResult(`自动安装插件失败: ${e}`);
+        setTicketSummary(makeTicketSummary("渠道插件自动安装", e, "auto_install_channel_plugins"));
+        throw e;
+      } finally {
+        unlisten();
+        setPluginInstallLoading(false);
+      }
+    });
+  };
+
+  const handleSkillsManage = async (action: "list" | "install" | "update" | "reinstall") => {
+    if (skillsLoading) return;
+    setSkillsLoading(true);
+    setSkillsResult(null);
+    try {
+      const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+      const result = await invoke<string>("skills_manage", {
+        action,
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+        installHint,
+      });
+      setSkillsResult(clampLogText(result));
+    } catch (e) {
+      setSkillsResult(`Skills 操作失败: ${e}`);
+    } finally {
+      setSkillsLoading(false);
+    }
+  };
+
+  const loadSkillsCatalog = async () => {
+    if (skillsCatalogLoading) return;
+    setSkillsCatalogLoading(true);
+    setSkillsResult(null);
+    try {
+      const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+      const list = await invoke<SkillCatalogItem[]>("list_skills_catalog", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+        installHint,
+      });
+      setSkillsCatalog(list || []);
+      setSelectedSkills((prev) => {
+        const next: Record<string, boolean> = {};
+        for (const s of list || []) {
+          next[s.name] = prev[s.name] ?? false;
+        }
+        return next;
+      });
+    } catch (e) {
+      setSkillsResult(`加载 Skills 列表失败: ${e}`);
+    } finally {
+      setSkillsCatalogLoading(false);
+    }
+  };
+
+  const handleRepairSelectedSkills = async () => {
+    enqueueTask("修复选中Skills", async () => {
+      if (skillsRepairLoading) return;
+      const selected = Object.keys(selectedSkills).filter((k) => selectedSkills[k]);
+      if (!selected.length) {
+        setSkillsResult("请先勾选至少一个 skill");
+        return;
+      }
+      setSkillsRepairLoading(true);
+      setSkillsResult(null);
+      setSkillsRepairProgress(null);
+      setSkillsRepairProgressLog([]);
+      const unlisten = await listen<SkillsRepairProgressEvent>("skills-repair-progress", (e) => {
+        const payload = e.payload;
+        if (!payload) return;
+        setSkillsRepairProgress(payload);
+        setSkillsRepairProgressLog((prev) => {
+          const line = `[${payload.current}/${payload.total}] ${payload.skill}: ${payload.message}`;
+          const next = [...prev, line];
+          return next.length > 120 ? next.slice(-120) : next;
+        });
+      });
+      try {
+        const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+        const result = await invoke<string>("repair_selected_skills", {
+          skillNames: selected,
+          customPath: normalizeConfigPath(customConfigPath) || undefined,
+          installHint,
+        });
+        setSkillsResult(clampLogText(result));
+        await loadSkillsCatalog();
+      } catch (e) {
+        setSkillsResult(`修复失败: ${e}`);
+        setTicketSummary(makeTicketSummary("修复选中Skills", e, "repair_selected_skills"));
+        throw e;
+      } finally {
+        unlisten();
+        setSkillsRepairLoading(false);
+      }
+    });
+  };
+
+  const handleExportDiagnosticBundle = async () => {
+    enqueueTask("导出诊断包", async () => {
+      if (diagnosticLoading) return;
+      setDiagnosticLoading(true);
+      setDiagnosticResult(null);
+      try {
+        const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+        const result = await invoke<string>("export_diagnostic_bundle", {
+          customPath: normalizeConfigPath(customConfigPath) || undefined,
+          installHint,
+        });
+        setDiagnosticResult(`诊断包已导出: ${result}`);
+      } catch (e) {
+        setDiagnosticResult(`导出诊断包失败: ${e}`);
+        setTicketSummary(makeTicketSummary("导出诊断包", e, "export_diagnostic_bundle"));
+        throw e;
+      } finally {
+        setDiagnosticLoading(false);
+      }
+    });
+  };
+
+  const loadSnapshots = async () => {
+    if (snapshotsLoading) return;
+    setSnapshotsLoading(true);
+    try {
+      const list = await invoke<string[]>("list_config_snapshots", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      });
+      setSnapshots(list || []);
+    } catch {
+      setSnapshots([]);
+    } finally {
+      setSnapshotsLoading(false);
+    }
+  };
+
+  const handleRollbackSnapshot = async (snapshotDir: string) => {
+    if (rollingBackSnapshot) return;
+    setRollingBackSnapshot(snapshotDir);
+    setDiagnosticResult(null);
+    try {
+      const result = await invoke<string>("rollback_config_snapshot", {
+        snapshotDir,
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      });
+      setDiagnosticResult(result);
+      await Promise.all([loadSavedAiConfig(), loadSavedChannels(), loadSnapshots(), runSelfCheck()]);
+    } catch (e) {
+      setDiagnosticResult(`回滚失败: ${e}`);
+    } finally {
+      setRollingBackSnapshot(null);
+    }
+  };
+
   const envReady = nodeCheck?.ok && npmCheck?.ok;
   const canProceed = step === 0 ? envReady : true;
 
@@ -1192,7 +1672,7 @@ function App() {
       <main className="flex-1 p-6 overflow-auto">
         {/* Step 0: 环境检测 */}
         {step === 0 && (
-          <div className="max-w-2xl space-y-6">
+          <div className="w-full max-w-[1200px] mx-auto space-y-6">
             <h2 className="text-lg font-semibold">环境检测</h2>
             {checking ? (
               <div className="flex items-center gap-2 text-slate-400">
@@ -1301,7 +1781,7 @@ function App() {
 
         {/* Step 1: 安装 OpenClaw */}
         {step === 1 && (
-          <div className="max-w-2xl space-y-6">
+          <div className="w-full max-w-[1200px] mx-auto space-y-6">
             <h2 className="text-lg font-semibold">安装 OpenClaw</h2>
             <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-2">
               <p className="font-medium text-slate-200">本地 OpenClaw 管理</p>
@@ -1416,7 +1896,7 @@ function App() {
 
         {/* Step 2: 配置 AI 模型 */}
         {step === 2 && (
-          <div className="max-w-2xl space-y-6">
+          <div className="w-full max-w-[1200px] mx-auto space-y-6">
             <h2 className="text-lg font-semibold">配置 AI 模型</h2>
             <p className="text-slate-400">
               选择 AI 提供商并填入 API Key。支持自定义 API 地址（如 OneAPI、NewAPI 等中转服务）。
@@ -1706,11 +2186,21 @@ function App() {
 
         {/* Step 3: 启动服务 */}
         {step === 3 && (
-          <div className="max-w-2xl space-y-6">
+          <div className="w-full max-w-[1200px] mx-auto space-y-6">
             <h2 className="text-lg font-semibold">启动服务</h2>
             {customConfigPath && (
               <div className="bg-slate-800/50 rounded-lg p-3 text-sm text-slate-400">
                 配置路径: {normalizeConfigPath(customConfigPath)}
+              </div>
+            )}
+            {startupMigrationResult && startupMigrationResult.fixed_count > 0 && (
+              <div className="bg-emerald-900/20 border border-emerald-700 rounded-lg p-3 text-xs text-emerald-300 space-y-1">
+                <p>
+                  已自动修复插件兼容清单：{startupMigrationResult.fixed_count} 项
+                </p>
+                <p className="text-emerald-200">
+                  修复目录：{startupMigrationResult.fixed_dirs.join(", ")}
+                </p>
               </div>
             )}
             {exeCheckInfo && (
@@ -1750,11 +2240,367 @@ function App() {
               <Wrench className="w-5 h-5" />
               前台启动 Gateway（计划任务失败时用）
             </button>
+            <button
+              onClick={handleOpenSkillsOnboard}
+              disabled={onboardCliLoading}
+              className="flex items-center gap-2 px-6 py-3 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded-lg font-medium text-sm"
+            >
+              {onboardCliLoading ? (
+                <>
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  打开中...
+                </>
+              ) : (
+                <>
+                  <Wrench className="w-5 h-5" />
+                  安装/更新官方 Skills（推荐）
+                </>
+              )}
+            </button>
             {startResult && (
               <pre className="bg-slate-800 rounded-lg p-4 text-sm overflow-auto max-h-40">
                 {startResult}
               </pre>
             )}
+            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
+              <p className="font-medium text-slate-200">任务队列中心（防卡死）</p>
+              {queueTasks.length === 0 ? (
+                <p className="text-xs text-slate-500">暂无任务。重操作会进入队列并串行执行。</p>
+              ) : (
+                <div className="space-y-2 max-h-44 overflow-auto">
+                  {queueTasks
+                    .slice()
+                    .reverse()
+                    .map((t) => (
+                      <div key={t.id} className="bg-slate-900/40 border border-slate-700 rounded p-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-xs text-slate-200">
+                            {t.name}
+                            <span className="ml-2 text-slate-400">[{t.status}]</span>
+                          </p>
+                          <div className="flex gap-1">
+                            {(t.status === "queued" || t.status === "running") && (
+                              <button
+                                onClick={() => cancelTask(t.id)}
+                                className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                              >
+                                取消
+                              </button>
+                            )}
+                            {(t.status === "error" || t.status === "cancelled") &&
+                              t.retryCount < t.maxRetries && (
+                                <button
+                                  onClick={() => retryTask(t.id)}
+                                  className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded text-[11px]"
+                                >
+                                  重试
+                                </button>
+                              )}
+                          </div>
+                        </div>
+                        {t.error && <p className="text-[11px] text-rose-300 mt-1">{t.error}</p>}
+                      </div>
+                    ))}
+                </div>
+              )}
+            </div>
+            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="font-medium text-slate-200">安装后自检总控页</p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={runSelfCheck}
+                    disabled={selfCheckLoading}
+                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                  >
+                    {selfCheckLoading ? "检测中..." : "一键自检"}
+                  </button>
+                  <button
+                    onClick={handleMinimalRepair}
+                    className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 rounded text-xs"
+                  >
+                    一键最小修复
+                  </button>
+                </div>
+              </div>
+              {!!selfCheckItems.length && (
+                <div className="space-y-2">
+                  {selfCheckItems.map((item) => (
+                    <div key={item.key} className="rounded border border-slate-700 bg-slate-900/40 p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-slate-200 text-sm">
+                          {item.label}
+                          <span className={`ml-2 text-xs ${
+                            item.status === "ok"
+                              ? "text-emerald-400"
+                              : item.status === "warn"
+                                ? "text-amber-300"
+                                : "text-red-400"
+                          }`}>
+                            {item.status}
+                          </span>
+                        </p>
+                        {item.status !== "ok" && (
+                          <button
+                            onClick={() => handleFixSelfCheck(item.key)}
+                            disabled={selfCheckFixingKey === item.key}
+                            className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
+                          >
+                            {selfCheckFixingKey === item.key ? "修复中..." : "立即修复"}
+                          </button>
+                        )}
+                      </div>
+                      <pre className="mt-2 text-xs text-slate-400 whitespace-pre-wrap">{item.detail}</pre>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {selfCheckResult && <p className="text-xs text-sky-300">{selfCheckResult}</p>}
+            </div>
+            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
+              <p className="font-medium text-slate-200">渠道驱动的插件自动安装</p>
+              <div className="flex flex-wrap gap-3">
+                {["telegram", "qq", "feishu", "discord", "dingtalk"].map((id) => (
+                  <label key={id} className="flex items-center gap-1 text-xs text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={!!pluginSelection[id]}
+                      onChange={(e) =>
+                        setPluginSelection((prev) => ({ ...prev, [id]: e.target.checked }))
+                      }
+                    />
+                    {id}
+                  </label>
+                ))}
+              </div>
+              <button
+                onClick={handleAutoInstallPlugins}
+                disabled={pluginInstallLoading}
+                className="px-3 py-2 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-xs"
+              >
+                {pluginInstallLoading ? "安装中..." : "按勾选渠道自动安装/校验插件"}
+              </button>
+              {pluginInstallLoading && pluginInstallProgress && (
+                <div className="space-y-2">
+                  <p className="text-xs text-sky-300">
+                    当前进度：{pluginInstallProgress.current}/{pluginInstallProgress.total}，
+                    正在处理 `{pluginInstallProgress.channel}`（{pluginInstallProgress.status}）
+                  </p>
+                  <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-sky-500 rounded-full transition-all duration-300"
+                      style={{
+                        width: `${Math.max(
+                          5,
+                          Math.min(
+                            100,
+                            Math.round(
+                              (pluginInstallProgress.current / Math.max(pluginInstallProgress.total, 1)) * 100
+                            )
+                          )
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                  <pre className="bg-slate-900/40 rounded p-3 text-xs whitespace-pre-wrap max-h-28 overflow-auto">
+                    {pluginInstallProgressLog.join("\n")}
+                  </pre>
+                </div>
+              )}
+              {pluginInstallResult && (
+                <pre className="bg-slate-900/40 rounded p-3 text-xs whitespace-pre-wrap max-h-40 overflow-auto">
+                  {pluginInstallResult}
+                </pre>
+              )}
+            </div>
+            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
+              <p className="font-medium text-slate-200">Skills 管理面板</p>
+              <div className="flex flex-wrap gap-2">
+                <button onClick={loadSkillsCatalog} disabled={skillsCatalogLoading} className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs">刷新列表</button>
+                <button
+                  onClick={() =>
+                    setSelectedSkills(
+                      Object.fromEntries(skillsCatalog.map((s) => [s.name, true]))
+                    )
+                  }
+                  disabled={!skillsCatalog.length}
+                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                >
+                  全选
+                </button>
+                <button
+                  onClick={() =>
+                    setSelectedSkills(
+                      Object.fromEntries(skillsCatalog.map((s) => [s.name, !!s.eligible]))
+                    )
+                  }
+                  disabled={!skillsCatalog.length}
+                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                >
+                  选择可用项
+                </button>
+                <button
+                  onClick={handleRepairSelectedSkills}
+                  disabled={skillsRepairLoading}
+                  className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
+                >
+                  {skillsRepairLoading ? "修复中..." : "一键修复缺失依赖（选中）"}
+                </button>
+                <button onClick={() => handleSkillsManage("update")} disabled={skillsLoading} className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs">全量更新</button>
+              </div>
+              <div className="overflow-auto border border-slate-700 rounded-lg">
+                <table className="w-full min-w-[900px] text-xs">
+                  <thead className="bg-slate-900/60 text-slate-300">
+                    <tr>
+                      <th className="text-left px-2 py-2">选择</th>
+                      <th className="text-left px-2 py-2">Skill</th>
+                      <th className="text-left px-2 py-2">来源</th>
+                      <th className="text-left px-2 py-2">状态</th>
+                      <th className="text-left px-2 py-2">缺失项摘要</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {skillsCatalog.map((s) => {
+                      const missingParts = [
+                        s.missing.bins.length ? `bins:${s.missing.bins.join(",")}` : "",
+                        s.missing.any_bins.length ? `any:${s.missing.any_bins.join(",")}` : "",
+                        s.missing.env.length ? `env:${s.missing.env.join(",")}` : "",
+                        s.missing.config.length ? `cfg:${s.missing.config.slice(0, 2).join(",")}` : "",
+                        s.missing.os.length ? `os:${s.missing.os.join(",")}` : "",
+                      ].filter(Boolean);
+                      return (
+                        <tr key={s.name} className="border-t border-slate-800">
+                          <td className="px-2 py-2">
+                            <input
+                              type="checkbox"
+                              checked={!!selectedSkills[s.name]}
+                              onChange={(e) =>
+                                setSelectedSkills((prev) => ({ ...prev, [s.name]: e.target.checked }))
+                              }
+                            />
+                          </td>
+                          <td className="px-2 py-2 text-slate-200">{s.name}</td>
+                          <td className="px-2 py-2">{s.source || (s.bundled ? "bundled" : "unknown")}</td>
+                          <td className={`px-2 py-2 ${s.eligible ? "text-emerald-400" : "text-amber-300"}`}>
+                            {s.eligible ? "可用" : "待补依赖"}
+                          </td>
+                          <td className="px-2 py-2 text-slate-400">{missingParts.join(" | ") || "-"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {skillsRepairLoading && skillsRepairProgress && (
+                <div className="space-y-2">
+                  <p className="text-xs text-sky-300">
+                    修复进度：{skillsRepairProgress.current}/{skillsRepairProgress.total}，
+                    当前 `{skillsRepairProgress.skill}` - {skillsRepairProgress.message}
+                  </p>
+                  <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-emerald-500 rounded-full transition-all duration-300"
+                      style={{
+                        width: `${Math.max(
+                          5,
+                          Math.min(
+                            100,
+                            Math.round(
+                              (skillsRepairProgress.current / Math.max(skillsRepairProgress.total, 1)) * 100
+                            )
+                          )
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                  <pre className="bg-slate-900/40 rounded p-3 text-xs whitespace-pre-wrap max-h-28 overflow-auto">
+                    {skillsRepairProgressLog.join("\n")}
+                  </pre>
+                </div>
+              )}
+              {skillsResult && (
+                <pre className="bg-slate-900/40 rounded p-3 text-xs whitespace-pre-wrap max-h-48 overflow-auto">
+                  {skillsResult}
+                </pre>
+              )}
+            </div>
+            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
+              <p className="font-medium text-slate-200">诊断与回滚</p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={handleExportDiagnosticBundle}
+                  disabled={diagnosticLoading}
+                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                >
+                  {diagnosticLoading ? "导出中..." : "一键导出诊断包"}
+                </button>
+                <button
+                  onClick={loadSnapshots}
+                  disabled={snapshotsLoading}
+                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                >
+                  {snapshotsLoading ? "加载中..." : "刷新配置快照"}
+                </button>
+              </div>
+              {snapshots.length > 0 && (
+                <div className="space-y-2 max-h-40 overflow-auto">
+                  {snapshots.slice(0, 10).map((s) => (
+                    <div key={s} className="flex items-center justify-between gap-2 bg-slate-900/40 rounded p-2">
+                      <span className="text-xs text-slate-400 truncate">{s}</span>
+                      <button
+                        onClick={() => handleRollbackSnapshot(s)}
+                        disabled={rollingBackSnapshot === s}
+                        className="px-2 py-1 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs"
+                      >
+                        {rollingBackSnapshot === s ? "回滚中..." : "回滚"}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {diagnosticResult && <pre className="text-xs text-sky-300 whitespace-pre-wrap">{diagnosticResult}</pre>}
+              {ticketSummary && (
+                <div className="space-y-2">
+                  <p className="text-xs text-amber-300">可复制工单摘要（发给维护者）</p>
+                  <pre className="text-xs text-slate-300 whitespace-pre-wrap bg-slate-900/40 rounded p-2 max-h-28 overflow-auto">
+                    {ticketSummary}
+                  </pre>
+                  <button
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(ticketSummary);
+                        setDiagnosticResult("已复制工单摘要到剪贴板");
+                      } catch {
+                        setDiagnosticResult("复制失败，请手动复制");
+                      }
+                    }}
+                    className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs"
+                  >
+                    复制工单摘要
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="bg-gradient-to-r from-emerald-900/40 to-indigo-900/40 border border-emerald-700/40 rounded-lg p-4 text-sm text-slate-200 space-y-2">
+              <p className="font-medium">权益中心（免费额度 / 群支持 / 包月代理）</p>
+              <p className="text-xs text-slate-300">
+                每日免费额度、问题优先答疑、代理服务申请入口。推荐先加群获取试用额度。
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => openUrl("https://qm.qq.com/q/yEwM0TR6F4")}
+                  className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 rounded text-xs"
+                >
+                  一键加群（1085253453）
+                </button>
+                <button
+                  onClick={() => openUrl("https://github.com/3445286649/openclaw-deploy/issues/new")}
+                  className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs"
+                >
+                  提交申请/问题单
+                </button>
+              </div>
+            </div>
             <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
               <p className="font-medium text-slate-200">Telegram 快速配对</p>
               <div className="flex gap-2">

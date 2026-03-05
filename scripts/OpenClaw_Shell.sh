@@ -4,6 +4,28 @@
 
 set -euo pipefail
 
+# WSL 检测：若无原生 node，尝试使用 Windows Node（避免 Ubuntu 未装 Node 时直接失败）
+setup_wsl_node_if_needed() {
+  if command -v node &>/dev/null; then
+    return 0
+  fi
+  [[ -z "${WSL_DISTRO_NAME:-}" ]] && [[ ! "$(uname -r 2>/dev/null)" =~ [Mm]icrosoft ]] && return 0
+  local node_exe=""
+  for dir in /mnt/d/Nodejs "/mnt/c/Program Files/nodejs"; do
+    [[ -x "$dir/node.exe" ]] && node_exe="$dir/node.exe" && break
+  done
+  if [[ -n "$node_exe" ]]; then
+    mkdir -p ~/.local/bin
+    ln -sf "$node_exe" ~/.local/bin/node 2>/dev/null || true
+    export PATH="$HOME/.local/bin:$PATH"
+    if command -v node &>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+setup_wsl_node_if_needed || true
+
 # 颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,30 +59,43 @@ read_input() {
 
 # 查找 openclaw 命令（安装后需刷新 PATH）
 find_openclaw() {
-  # 加入常见 npm 全局路径
-  local npm_prefix
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+  # WSL 下 npm config 可能返回 Windows 路径，优先用 Linux 原生或 npx
+  local npm_prefix npm_root
   npm_prefix=$(npm config get prefix 2>/dev/null || true)
   npm_prefix="${npm_prefix%/}"
-  [[ -n "$npm_prefix" ]] && export PATH="$npm_prefix/bin:$PATH"
-  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+  if [[ -n "$npm_prefix" ]]; then
+    # 将 C:\path 转为 /mnt/c/path 供 WSL 使用
+    if [[ "$npm_prefix" =~ ^[A-Za-z]: ]]; then
+      local drive="${npm_prefix:0:1}"; drive="${drive,,}"
+      npm_prefix="/mnt/$drive${npm_prefix:2}"
+    fi
+    [[ -d "$npm_prefix/bin" ]] && export PATH="$npm_prefix/bin:$PATH"
+  fi
   hash -r 2>/dev/null || true
 
-  if command -v openclaw &>/dev/null; then
-    echo "openclaw"
-    return
-  fi
+  # 优先 Linux 原生路径
   [[ -x "$HOME/.local/bin/openclaw" ]] && { echo "$HOME/.local/bin/openclaw"; return; }
-  [[ -n "$npm_prefix" && -x "$npm_prefix/bin/openclaw" ]] && { echo "$npm_prefix/bin/openclaw"; return; }
-  # npm root -g 的 ../bin
-  local npm_root
+  [[ -x "/usr/local/bin/openclaw" ]] && { echo "/usr/local/bin/openclaw"; return; }
+  [[ -x "/opt/homebrew/bin/openclaw" ]] && { echo "/opt/homebrew/bin/openclaw"; return; }
   npm_root=$(npm root -g 2>/dev/null || true)
   if [[ -n "$npm_root" && -x "$npm_root/../bin/openclaw" ]]; then
     echo "$npm_root/../bin/openclaw"
     return
   fi
-  [[ -x "/usr/local/bin/openclaw" ]] && { echo "/usr/local/bin/openclaw"; return; }
-  [[ -x "/opt/homebrew/bin/openclaw" ]] && { echo "/opt/homebrew/bin/openclaw"; return; }
-  # 最后尝试 npx（可运行刚安装的包）
+  if command -v openclaw &>/dev/null; then
+    local oc_path
+    oc_path=$(command -v openclaw)
+    # WSL：若 openclaw 来自 /mnt/*（Windows 路径），其内部路径解析可能出错，改用 npx
+    if [[ "$(uname -r 2>/dev/null)" =~ [Mm]icrosoft ]] && [[ "$oc_path" == /mnt/* ]]; then
+      if command -v npx &>/dev/null; then
+        echo "npx openclaw"
+        return
+      fi
+    fi
+    echo "openclaw"
+    return
+  fi
   if command -v npx &>/dev/null; then
     echo "npx openclaw"
     return
@@ -109,6 +144,248 @@ open_browser() {
   else
     echo -e "${YELLOW}请手动打开: $url${NC}"
   fi
+}
+
+# 插件 manifest 补齐：clawdbot.plugin.json -> openclaw.plugin.json（避免 plugin manifest not found）
+# 返回补齐的数量（0=无变更）
+ensure_manifest_compat() {
+  local ext_root="$OPENCLAW_CONFIG/extensions"
+  [[ ! -d "$ext_root" ]] && echo "0" && return 0
+  local count=0 dir old_manifest new_manifest
+  for dir in "$ext_root"/*/; do
+    [[ -d "$dir" ]] || continue
+    old_manifest="${dir}clawdbot.plugin.json"
+    new_manifest="${dir}openclaw.plugin.json"
+    if [[ -f "$old_manifest" && ! -f "$new_manifest" ]]; then
+      cp -f "$old_manifest" "$new_manifest" 2>/dev/null && ((count++)) || true
+    fi
+  done
+  echo "$count"
+}
+
+# 一键最小修复：manifest补齐 -> doctor --fix -> plugins -> skills check -> gateway自检
+minimal_repair() {
+  export OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG"
+  echo ""
+  echo -e "${CYAN}[1/5] manifest 补齐...${NC}"
+  local fixed_count
+  fixed_count=$(ensure_manifest_compat)
+  if [[ "${fixed_count:-0}" -gt 0 ]]; then
+    echo -e "${GREEN}[OK] 已补齐 $fixed_count 个插件 manifest${NC}"
+  else
+    echo -e "${GRAY}[OK] 无需补齐${NC}"
+  fi
+
+  echo -e "${CYAN}[2/5] doctor --fix...${NC}"
+  run_openclaw doctor --fix 2>/dev/null || true
+
+  echo -e "${CYAN}[3/5] plugins 校验...${NC}"
+  run_openclaw plugins list 2>/dev/null || true
+
+  echo -e "${CYAN}[4/5] skills check...${NC}"
+  run_openclaw skills check 2>/dev/null || true
+
+  echo -e "${CYAN}[5/5] gateway 自检...${NC}"
+  if gateway_running; then
+    echo -e "${GREEN}[OK] Gateway: 运行中${NC}"
+  else
+    echo -e "${GRAY}[OK] Gateway: 已停止${NC}"
+  fi
+
+  echo ""
+  echo -e "${GREEN}[完成] 最小修复已执行${NC}"
+}
+
+# 生成可复制工单摘要（失败时供用户发给维护者）
+write_ticket_summary() {
+  local action="$1"
+  local err_msg="$2"
+  local first_line
+  first_line=$(echo "$err_msg" | head -1)
+  [[ -z "$first_line" ]] && first_line="$err_msg"
+  echo ""
+  echo -e "${YELLOW}--- 可复制工单摘要（发给维护者）---${NC}"
+  echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "操作: $action"
+  echo "错误摘要: $first_line"
+  echo "建议: 点击「一键最小修复」后重试；若仍失败请附上完整日志与截图。"
+  echo -e "${YELLOW}----------------------------------------${NC}"
+}
+
+# 渠道状态（用 jq 或 grep 解析）
+show_channel_status() {
+  echo ""
+  echo -e "${YELLOW}--- 渠道状态 ---${NC}"
+  echo -e "${GRAY}  配置: $OPENCLAW_CONFIG${NC}"
+  echo ""
+  local cfg="$OPENCLAW_CONFIG/openclaw.json"
+  local ch_cfg="$OPENCLAW_CONFIG/channels.json"
+  local check_file=""
+  [[ -f "$cfg" ]] && check_file="$cfg"
+  [[ -f "$ch_cfg" ]] && check_file="${check_file:+$check_file }$ch_cfg"
+  if [[ -n "$check_file" ]]; then
+    for name in "Telegram:telegram" "Discord:discord" "飞书:feishu" "钉钉:dingtalk" "QQ:qq"; do
+      local label="${name%%:*}" id="${name#*:}"
+      local ok=""
+      if command -v jq &>/dev/null; then
+        ok=$(jq -r --arg c "$id" '.channels[$c] // .[$c] // empty' $check_file 2>/dev/null | head -1)
+      fi
+      [[ -z "$ok" ]] && ok=$(grep -l "\"$id\"" $check_file 2>/dev/null | head -1)
+      if [[ -n "$ok" ]]; then
+        echo -e "  ${GREEN}$label: 已配置${NC}"
+      else
+        echo -e "  ${GRAY}$label: 未配置${NC}"
+      fi
+    done
+  else
+    echo -e "${GRAY}  未找到配置文件${NC}"
+  fi
+  echo ""
+}
+
+# 渠道接入：安装插件 + channels add
+channel_setup() {
+  echo ""
+  echo -e "${YELLOW}--- 接入对话渠道 ---${NC}"
+  echo "  [1] Telegram  [2] Discord  [3] 飞书  [4] 钉钉  [5] QQ  [0] 返回"
+  read_input -p "选择: " ch
+  case "$ch" in
+    0) return ;;
+    1) local plugin="" channel_name="Telegram" channel_id="telegram" ;;
+    2) plugin="" channel_name="Discord" channel_id="discord" ;;
+    3) plugin="@openclaw/feishu" channel_name="飞书" channel_id="feishu" ;;
+    4) plugin="@adongguo/openclaw-dingtalk" channel_name="钉钉" channel_id="dingtalk" ;;
+    5) plugin="@sliverp/qqbot" channel_name="QQ" channel_id="qq" ;;
+    *) echo -e "${YELLOW}无效${NC}"; return ;;
+  esac
+
+  if [[ -n "$plugin" ]]; then
+    echo -e "${CYAN}正在安装 $channel_name 插件: $plugin ...${NC}"
+    export OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG"
+    local err_out
+    err_out=$($OPENCLAW_CMD plugins install "${plugin}@latest" 2>&1)
+    if [[ $? -ne 0 ]]; then
+      echo -e "${RED}[失败] 插件安装失败${NC}"
+      write_ticket_summary "渠道插件安装 ($channel_name)" "$err_out"
+      return
+    fi
+    ensure_manifest_compat >/dev/null
+    echo -e "${GREEN}[OK] 插件已安装${NC}"
+  fi
+
+  echo -e "${CYAN}启动 openclaw channels add，按提示填写 Token / App ID 等${NC}"
+  echo "获取: Telegram: @BotFather | Discord: discord.com/developers | 飞书: open.feishu.cn | 钉钉: open.dingtalk.com | QQ: bot.q.qq.com"
+  echo ""
+  local add_args=("channels" "add")
+  if run_openclaw channels add --help 2>/dev/null | grep -q '\--channel'; then
+    add_args+=("--channel" "$channel_id")
+  fi
+  run_openclaw "${add_args[@]}"
+  if [[ $? -eq 0 ]] && gateway_running; then
+    read_input -p "Gateway 运行中，是否重启以应用新配置？(Y/n): " restart
+    restart="${restart:-y}"
+    if [[ "${restart,,}" != "n" && "${restart,,}" != "no" ]]; then
+      run_openclaw gateway restart 2>/dev/null || true
+      echo -e "${GREEN}[OK] Gateway 已重启${NC}"
+    fi
+    echo "  查看配对码: openclaw pairing list $channel_id"
+    echo "  批准配对: openclaw pairing approve $channel_id <CODE>"
+  fi
+}
+
+# 配置备份
+backup_config() {
+  local out_dir="${1:-$HOME}"
+  local zip_name="openclaw_backup_$(date +%Y%m%d_%H%M%S).zip"
+  local zip_path="$out_dir/$zip_name"
+  if [[ ! -d "$OPENCLAW_CONFIG" ]]; then
+    echo -e "${YELLOW}配置目录不存在${NC}"
+    return 1
+  fi
+  if command -v zip &>/dev/null; then
+    (cd "$(dirname "$OPENCLAW_CONFIG")" && zip -r "$zip_path" "$(basename "$OPENCLAW_CONFIG")" -x "*.log" 2>/dev/null)
+  elif command -v tar &>/dev/null; then
+    tar -czf "${zip_path%.zip}.tar.gz" -C "$(dirname "$OPENCLAW_CONFIG")" "$(basename "$OPENCLAW_CONFIG")" 2>/dev/null
+    zip_path="${zip_path%.zip}.tar.gz"
+  else
+    echo -e "${RED}需要 zip 或 tar${NC}"
+    return 1
+  fi
+  if [[ -f "$zip_path" ]]; then
+    echo -e "${GREEN}[OK] 备份已保存: $zip_path${NC}"
+  else
+    echo -e "${RED}[失败] 备份失败${NC}"
+  fi
+}
+
+# 配置恢复
+restore_config() {
+  local zip_path="$1"
+  if [[ ! -f "$zip_path" ]]; then
+    echo -e "${RED}文件不存在${NC}"
+    return 1
+  fi
+  mkdir -p "$OPENCLAW_CONFIG"
+  if [[ "$zip_path" == *.zip ]]; then
+    unzip -o "$zip_path" -d "$(dirname "$OPENCLAW_CONFIG")" 2>/dev/null || true
+  else
+    tar -xzf "$zip_path" -C "$(dirname "$OPENCLAW_CONFIG")" 2>/dev/null || true
+  fi
+  echo -e "${GREEN}[OK] 配置已恢复${NC}"
+}
+
+# 诊断导出
+export_diagnostic() {
+  local out_dir="${1:-$HOME}"
+  local fname="openclaw_diagnostic_$(date +%Y%m%d_%H%M%S).txt"
+  local fpath="$out_dir/$fname"
+  {
+    echo "=== OpenClaw Diagnostic Export ==="
+    echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "Path: $OPENCLAW_CMD"
+    echo "Version: $($OPENCLAW_CMD --version 2>/dev/null)"
+    echo "Gateway: $(gateway_running && echo Running || echo Stopped)"
+    echo ""
+    echo "--- openclaw doctor ---"
+    run_openclaw doctor 2>&1
+    echo ""
+    echo "--- openclaw status ---"
+    run_openclaw status 2>&1
+  } > "$fpath"
+  echo -e "${GREEN}[OK] 诊断已导出: $fpath${NC}"
+}
+
+# 打开文档
+open_docs() {
+  local url="https://docs.openclaw.ai/cli"
+  echo -e "${CYAN}文档: $url${NC}"
+  if command -v xdg-open &>/dev/null; then
+    xdg-open "$url" 2>/dev/null &
+  elif command -v open &>/dev/null; then
+    open "$url" 2>/dev/null &
+  fi
+}
+
+# 嗅探 OpenClaw 安装位置
+find_openclaw_locations() {
+  local current_dir
+  if [[ "$OPENCLAW_CMD" == */* ]]; then
+    current_dir="${OPENCLAW_CMD%/*}"
+  else
+    current_dir=$(dirname "$(command -v $OPENCLAW_CMD 2>/dev/null)" 2>/dev/null)
+  fi
+  local npm_prefix npm_root
+  npm_prefix=$(npm config get prefix 2>/dev/null)
+  npm_root=$(npm root -g 2>/dev/null)
+  for dir in /usr/local/bin /opt/homebrew/bin "$HOME/.local/bin" "${npm_prefix%/}/bin" "${npm_root%/}/../bin"; do
+    [[ -z "$dir" || ! -d "$dir" ]] && continue
+    dir="${dir%/}"
+    [[ -x "$dir/openclaw" ]] || continue
+    local ver="" cur=""
+    ver=$("$dir/openclaw" --version 2>/dev/null) || true
+    [[ "$dir" == "$current_dir" ]] && cur=" (当前)"
+    echo "$dir|$ver|$cur"
+  done
 }
 
 # 环境检测与安装
@@ -164,50 +441,52 @@ ensure_openclaw() {
   return 0
 }
 
-# 显示主菜单
+# 显示主菜单（与 Windows OpenClaw_Shell.ps1 功能对应）
 show_header() {
   clear
   echo ""
   echo -e "${CYAN}==========================================${NC}"
   echo -e "${CYAN}  OpenClaw (Linux/macOS)${NC}"
   echo -e "${CYAN}==========================================${NC}"
-  echo -e "${GRAY}  配置路径: $OPENCLAW_CONFIG${NC}"
+  local oc_dir
+  if [[ "$OPENCLAW_CMD" == */* ]]; then
+    oc_dir="${OPENCLAW_CMD%/*}"
+  else
+    oc_dir=$(command -v $OPENCLAW_CMD 2>/dev/null | xargs dirname 2>/dev/null)
+  fi
+  echo -e "${GRAY}  路径: ${oc_dir:-$OPENCLAW_CMD}${NC}"
   if gateway_running; then
     echo -e "${GREEN}  Gateway: 运行中${NC}"
   else
     echo -e "${GRAY}  Gateway: 已停止${NC}"
   fi
+  echo -e "${GRAY}  配置: $OPENCLAW_CONFIG${NC}"
   echo ""
-  echo -e "  [1]  快速配置 - 硅基流动 API + 模型"
+  echo -e "  [1]  快速配置 - 首次使用 / API / 渠道接入"
   echo -e "  [2]  启动 Gateway"
-  echo -e "  [3]  停止 Gateway"
-  echo -e "  [4]  打开对话界面"
-  echo -e "  [5]  常用命令 - status / doctor 等"
-  echo -e "  [6]  检查更新"
+  echo -e "  [3]  常用命令 - status / gateway / doctor 等"
+  echo -e "  [4]  运行 OpenClaw - 进入 openclaw 命令行"
+  echo -e "  [5]  检查更新"
+  echo -e "  [6]  打开对话界面"
   echo -e "  [7]  配置路径 - 设置 OPENCLAW_STATE_DIR"
+  echo -e "  [8]  帮助与文档"
+  echo -e "  [9]  安装管理 - 嗅探 / 删除 / 热迁移"
+  echo -e "  [10] 工具箱 - 备份 / 恢复 / 诊断 / Skills / 最小修复"
   echo -e "  [0]  退出"
   echo -e "${CYAN}==========================================${NC}"
   echo ""
 }
 
-# 快速配置（硅基流动）
-quick_config() {
+# 快速配置（硅基流动）- 与 Windows [b] 对应
+quick_config_siliconflow() {
   echo ""
   echo -e "${YELLOW}--- 快速配置（硅基流动）---${NC}"
-  echo "填写配置目录完整路径（默认 $HOME/.openclaw）"
-  read_input -p "配置路径 [回车默认]: " custom_path
-  if [[ -n "$custom_path" ]]; then
-    OPENCLAW_CONFIG="${custom_path%/}"
-    export OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG"
-  fi
   mkdir -p "$OPENCLAW_CONFIG"
 
-  echo ""
   echo "选择模型:"
   local i=1
   for item in "${FIXED_MODELS[@]}"; do
-    local id="${item%%:*}"
-    local label="${item#*:}"
+    local id="${item%%:*}" label="${item#*:}"
     echo -e "  [$i] $label ($id)"
     ((i++)) || true
   done
@@ -228,23 +507,51 @@ quick_config() {
     return
   fi
 
-  echo ""
-  echo -e "${CYAN}正在执行配置 (模型: $model_id)...${NC}"
-  export OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG"
-  $OPENCLAW_CMD onboard --non-interactive \
-    --mode local \
-    --auth-choice custom-api-key \
-    --custom-base-url "$DEFAULT_BASE_URL" \
-    --custom-model-id "$model_id" \
-    --custom-api-key "$api_key" \
-    --custom-compatibility openai \
-    --secret-input-mode plaintext \
-    --gateway-port 18789 \
-    --gateway-bind loopback \
-    --skip-skills --skip-channels --skip-daemon \
-    --accept-risk 2>/dev/null || true
+  read_input -p "是否安装官方 Skills 依赖? (Y/n): " install_skills_choice
+  install_skills_choice="$(echo "${install_skills_choice:-y}" | tr '[:upper:]' '[:lower:]')"
+  local skip_skills="false"
+  [[ "$install_skills_choice" == "n" || "$install_skills_choice" == "no" ]] && skip_skills="true"
 
+  echo ""
+  local mcount
+  mcount=$(ensure_manifest_compat)
+  [[ "${mcount:-0}" -gt 0 ]] && echo -e "${GRAY}[预处理] 已补齐 $mcount 个插件 manifest${NC}"
+  echo -e "${CYAN}正在执行配置 (模型: $model_id, Skills: $([[ "$skip_skills" == "true" ]] && echo 跳过 || echo 安装))...${NC}"
+  export OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG"
+  local onboard_args=(
+    onboard --non-interactive --mode local
+    --auth-choice custom-api-key --custom-base-url "$DEFAULT_BASE_URL"
+    --custom-model-id "$model_id" --custom-api-key "$api_key"
+    --custom-compatibility openai --node-manager npm --secret-input-mode plaintext
+    --gateway-port 18789 --gateway-bind loopback
+    --skip-channels --skip-daemon --accept-risk
+  )
+  [[ "$skip_skills" == "true" ]] && onboard_args+=(--skip-skills)
+  $OPENCLAW_CMD "${onboard_args[@]}" 2>/dev/null || true
   echo -e "${GREEN}[OK] 配置完成${NC}"
+}
+
+# 快速配置主菜单（与 Windows [1] 子菜单对应）
+quick_config_menu() {
+  while true; do
+    echo ""
+    echo -e "${YELLOW}--- 快速配置 ---${NC}"
+    echo "  [a] 交互式配置 - 完整向导 (openclaw onboard)"
+    echo "  [b] 快速配置 - 硅基流动 API + 模型 + 可选 Skills"
+    echo "  [c] 接入对话渠道 - Telegram / QQ / 飞书 / 钉钉 / Discord"
+    echo "  [d] 查看所有渠道状态"
+    echo "  [0] 返回主菜单"
+    read_input -p "请选择: " cfg
+    cfg="${cfg:-}"
+    case "$cfg" in
+      a) echo -e "${CYAN}正在打开交互式配置...${NC}"; run_openclaw onboard ;;
+      b) quick_config_siliconflow ;;
+      c) channel_setup ;;
+      d) show_channel_status ;;
+      0) return ;;
+      *) echo -e "${YELLOW}无效${NC}" ;;
+    esac
+  done
 }
 
 # 主流程
@@ -252,6 +559,7 @@ main() {
   # 快捷参数（需先解析 openclaw 路径）
   OPENCLAW_CMD=$(find_openclaw)
   case "${1:-}" in
+    minimal-repair) ensure_openclaw && minimal_repair; exit 0 ;;
     gateway-start) ensure_openclaw && start_gateway && sleep 3 && open_browser; exit 0 ;;
     gateway-stop) stop_gateway; exit 0 ;;
     open-chat) start_gateway; sleep 4; open_browser; exit 0 ;;
@@ -270,7 +578,7 @@ main() {
     choice="${choice:-}"
 
     case "$choice" in
-      1) quick_config ;;
+      1) quick_config_menu ;;
       2)
         echo ""
         echo -e "${CYAN}正在启动 Gateway...${NC}"
@@ -284,10 +592,40 @@ main() {
         fi
         ;;
       3)
-        stop_gateway
-        echo -e "${GREEN}[OK] Gateway 已停止${NC}"
+        while true; do
+          echo ""
+          echo -e "${YELLOW}--- 常用命令 ---${NC}"
+          echo "  [1] Gateway 状态  [2] 启动  [3] 停止  [4] 重启"
+          echo "  [5] 模型列表  [6] 渠道状态  [7] 诊断检查  [8] 完整状态"
+          echo "  [0] 返回主菜单"
+          read_input -p "选择: " sub
+          case "$sub" in
+            1) run_openclaw gateway status ;;
+            2) start_gateway; sleep 2; run_openclaw gateway status ;;
+            3) stop_gateway; echo -e "${GREEN}[OK] 已停止${NC}" ;;
+            4) run_openclaw gateway restart ;;
+            5) run_openclaw models list ;;
+            6) run_openclaw channels status ;;
+            7) run_openclaw doctor ;;
+            8) run_openclaw status ;;
+            0) break ;;
+            *) echo "无效" ;;
+          esac
+        done
         ;;
       4)
+        echo ""
+        echo -e "${CYAN}进入 openclaw 命令行，输入 exit 退出${NC}"
+        run_openclaw
+        ;;
+      5)
+        echo ""
+        echo -e "${CYAN}正在更新 OpenClaw...${NC}"
+        npm install -g openclaw@latest 2>/dev/null || npm install -g openclaw@latest --prefix "$HOME/.local" 2>/dev/null
+        echo -e "${GREEN}[OK] 完成${NC}"
+        OPENCLAW_CMD=$(find_openclaw)
+        ;;
+      6)
         if gateway_running; then
           open_browser
         else
@@ -297,35 +635,147 @@ main() {
           open_browser
         fi
         ;;
-      5)
-        echo ""
-        echo -e "${YELLOW}--- 常用命令 ---${NC}"
-        echo "  [1] status   [2] gateway status   [3] doctor"
-        read_input -p "选择: " sub
-        case "$sub" in
-          1) run_openclaw status ;;
-          2) run_openclaw gateway status ;;
-          3) run_openclaw doctor ;;
-          *) echo "无效" ;;
-        esac
-        ;;
-      6)
-        echo ""
-        echo -e "${CYAN}正在更新 OpenClaw...${NC}"
-        npm install -g openclaw@latest
-        echo -e "${GREEN}[OK] 完成${NC}"
-        OPENCLAW_CMD=$(find_openclaw)
-        ;;
       7)
-        echo ""
-        echo -e "${YELLOW}当前配置路径: $OPENCLAW_CONFIG${NC}"
-        echo "设置自定义路径（export OPENCLAW_STATE_DIR=路径）"
-        read_input -p "新路径 (留空取消): " new_path
-        if [[ -n "$new_path" ]]; then
-          OPENCLAW_CONFIG="${new_path%/}"
-          echo "当前会话已切换，持久化请加入 ~/.bashrc 或 ~/.zshrc:"
-          echo "  export OPENCLAW_STATE_DIR=\"$OPENCLAW_CONFIG\""
-        fi
+        while true; do
+          echo ""
+          echo -e "${YELLOW}--- 配置路径 ---${NC}"
+          echo "  当前: $OPENCLAW_CONFIG"
+          echo "  [a] 设置自定义路径  [b] 恢复默认  [c] 持久化到 shell 配置"
+          echo "  [0] 返回"
+          read_input -p "选择: " cp
+          case "$cp" in
+            a)
+              read_input -p "新路径 (留空取消): " new_path
+              if [[ -n "$new_path" ]]; then
+                OPENCLAW_CONFIG="${new_path%/}"
+                export OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG"
+                echo -e "${GREEN}[OK] 当前会话已切换${NC}"
+              fi
+              ;;
+            b)
+              OPENCLAW_CONFIG="$HOME/.openclaw"
+              export OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG"
+              echo -e "${GREEN}[OK] 已恢复默认${NC}"
+              ;;
+            c)
+              local rc_file
+              [[ -f "$HOME/.zshrc" ]] && rc_file="$HOME/.zshrc" || rc_file="$HOME/.bashrc"
+              echo "" >> "$rc_file"
+              echo "# OpenClaw 配置路径" >> "$rc_file"
+              echo "export OPENCLAW_STATE_DIR=\"$OPENCLAW_CONFIG\"" >> "$rc_file"
+              echo -e "${GREEN}[OK] 已追加到 $rc_file，新开终端生效${NC}"
+              ;;
+            0) break ;;
+            *) echo "无效" ;;
+          esac
+        done
+        ;;
+      8) open_docs ;;
+      9)
+        while true; do
+          echo ""
+          echo -e "${YELLOW}--- 安装管理 ---${NC}"
+          echo "  [a] 一键嗅探 - 检测所有 OpenClaw 安装"
+          echo "  [b] 删除安装  [c] 热迁移  [0] 返回"
+          read_input -p "选择: " im
+          case "$im" in
+            a)
+              echo ""
+              local locs line dir ver cur
+              locs=$(find_openclaw_locations 2>/dev/null || true)
+              if [[ -z "$locs" ]]; then
+                echo -e "${YELLOW}未检测到安装${NC}"
+              else
+                local i=1
+                while IFS= read -r line; do
+                  [[ -z "$line" ]] && continue
+                  dir="${line%%|*}"
+                  ver="${line#*|}"
+                  cur="${ver##*|}"
+                  ver="${ver%|*}"
+                  echo -e "  [$i] $dir${ver:+ $ver}$cur"
+                  ((i++)) || true
+                done <<< "$locs"
+              fi
+              ;;
+            b|c) echo -e "${GRAY}请手动删除或迁移目录后重装${NC}" ;;
+            0) break ;;
+            *) echo "无效" ;;
+          esac
+        done
+        ;;
+      10)
+        while true; do
+          echo ""
+          echo -e "${YELLOW}--- 工具箱 ---${NC}"
+          echo "  [a] 配置备份  [b] 配置恢复  [c] 诊断导出"
+          echo "  [d] 代理设置  [e] 修复 Gateway  [f] 前台启动 Gateway"
+          echo "  [g] Skills 管理  [h] 一键最小修复  [0] 返回"
+          read_input -p "选择: " tool
+          case "$tool" in
+            a) read_input -p "保存目录 (默认 $HOME): " out; backup_config "${out:-$HOME}" ;;
+            b)
+              read_input -p "备份文件路径: " zip_path
+              [[ -n "$zip_path" ]] && restore_config "$zip_path"
+              ;;
+            c) read_input -p "保存目录 (默认 $HOME): " out; export_diagnostic "${out:-$HOME}" ;;
+            d)
+              echo "当前 proxy: $(npm config get proxy 2>/dev/null || echo 未设置)"
+              read_input -p "设置代理 (留空清除): " px
+              if [[ -n "$px" ]]; then
+                npm config set proxy "$px" && npm config set https-proxy "$px"
+                echo -e "${GREEN}[OK] 已设置${NC}"
+              else
+                npm config delete proxy 2>/dev/null; npm config delete https-proxy 2>/dev/null
+                echo -e "${GREEN}[OK] 已清除${NC}"
+              fi
+              ;;
+            e)
+              echo -e "${CYAN}停止 -> 重新注册 -> 启动${NC}"
+              stop_gateway
+              sleep 2
+              run_openclaw gateway install --force 2>/dev/null || true
+              start_gateway
+              sleep 3
+              gateway_running && echo -e "${GREEN}[OK] Gateway 已修复${NC}" || echo -e "${YELLOW}请用选项 2 启动${NC}"
+              ;;
+            f)
+              echo -e "${CYAN}新开终端运行: openclaw gateway (保持窗口不关)${NC}"
+              echo "  export OPENCLAW_STATE_DIR=\"$OPENCLAW_CONFIG\""
+              echo "  openclaw gateway"
+              ;;
+            g)
+              echo ""
+              echo "  [1] 列出 Skills  [2] 检查依赖  [3] 一键安装/更新"
+              read_input -p "选择: " sk
+              case "$sk" in
+                1) ensure_manifest_compat >/dev/null; run_openclaw skills list ;;
+                2) run_openclaw skills check ;;
+                3)
+                  echo -e "${CYAN}[预处理] manifest 补齐 + doctor --fix...${NC}"
+                  ensure_manifest_compat >/dev/null
+                  run_openclaw doctor --fix 2>/dev/null || true
+                  echo -e "${CYAN}正在安装/更新 Skills...${NC}"
+                  local err_out oc_ec
+                  export OPENCLAW_STATE_DIR="$OPENCLAW_CONFIG"
+                  err_out=$($OPENCLAW_CMD onboard --non-interactive --accept-risk --mode local --auth-choice skip --node-manager npm --skip-channels --skip-daemon --skip-health --skip-ui 2>&1)
+                  oc_ec=$?
+                  if [[ $oc_ec -eq 0 ]]; then
+                    echo -e "${GREEN}[OK] Skills 已更新${NC}"
+                    run_openclaw skills check
+                  else
+                    echo -e "${RED}[失败] Skills 更新失败${NC}"
+                    write_ticket_summary "Skills 安装/更新" "$err_out"
+                  fi
+                  ;;
+                *) echo "无效" ;;
+              esac
+              ;;
+            h) minimal_repair ;;
+            0) break ;;
+            *) echo "无效" ;;
+          esac
+        done
         ;;
       0) echo -e "${GREEN}已退出${NC}"; exit 0 ;;
       *) echo -e "${YELLOW}无效输入${NC}" ;;

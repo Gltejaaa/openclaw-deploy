@@ -580,6 +580,19 @@ function App() {
     };
   }, [customConfigPath, step]);
 
+  // 窗口重新获得焦点时刷新安装状态（例如脚本删除后切回应用）
+  useEffect(() => {
+    const onFocus = () => {
+      if (step === 1) {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        void refreshLocalInfo(customInstallPath.trim() || undefined, cfgPath);
+      }
+    };
+    const handler = () => document.visibilityState === "visible" && onFocus();
+    document.addEventListener("visibilitychange", handler);
+    return () => document.removeEventListener("visibilitychange", handler);
+  }, [step, customConfigPath, customInstallPath]);
+
   useEffect(() => {
     const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
     const installHint = customInstallPath.trim() || undefined;

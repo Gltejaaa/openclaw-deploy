@@ -18,6 +18,10 @@ Write-Host ""
 # 1. 构建
 Write-Host "[1/4] 正在构建 Tauri 应用..." -ForegroundColor Yellow
 Set-Location $root
+$prepareBundled = Join-Path $root "scripts\prepare-bundled-extensions.ps1"
+if (Test-Path $prepareBundled) {
+    & $prepareBundled
+}
 npm run tauri build
 if ($LASTEXITCODE -ne 0) {
     Write-Host "构建失败" -ForegroundColor Red
@@ -42,7 +46,15 @@ if (Test-Path $exePath) {
 # NSIS 安装包
 $nsisDir = Join-Path $bundleDir "nsis"
 if (Test-Path $nsisDir) {
-    $nsisExe = Get-ChildItem $nsisDir -Filter "*.exe" | Select-Object -First 1
+    $nsisExe = Get-ChildItem $nsisDir -Filter "*.exe" |
+        Where-Object { $_.Name -like "*_${ver}_*" } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if (-not $nsisExe) {
+        $nsisExe = Get-ChildItem $nsisDir -Filter "*.exe" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+    }
     if ($nsisExe) {
         Copy-Item $nsisExe.FullName (Join-Path $releaseDir $nsisExe.Name)
         Write-Host "  - $($nsisExe.Name)" -ForegroundColor Green
@@ -69,6 +81,11 @@ if (Test-Path $shellScript) {
     Copy-Item $shellScript $releaseDir
     Write-Host "  - OpenClaw_Shell_Install.cmd" -ForegroundColor Green
 }
+$installOnly = Join-Path $root "scripts\OpenClaw_Install_Only.ps1"
+if (Test-Path $installOnly) {
+    Copy-Item $installOnly $releaseDir
+    Write-Host "  - OpenClaw_Install_Only.ps1" -ForegroundColor Green
+}
 $shellPs1 = Join-Path $root "scripts\OpenClaw_Shell.ps1"
 if (Test-Path $shellPs1) {
     Copy-Item $shellPs1 $releaseDir
@@ -86,10 +103,10 @@ if (Test-Path $shellSh) {
     Write-Host "  - OpenClaw_Shell.sh (Linux/macOS)" -ForegroundColor Green
 }
 
-# 使用文档（通过枚举避免中文路径编码问题）
-$docFile = Get-ChildItem -Path $root -Filter "*.md" -File | Where-Object { $_.Name -ne "README.md" } | Select-Object -First 1
-if ($docFile) {
-    Copy-Item $docFile.FullName (Join-Path $releaseDir $docFile.Name) -Force
+# 使用文档（显式指定，避免拿错其他 md）
+$docFile = Join-Path $root "使用文档.md"
+if (Test-Path $docFile) {
+    Copy-Item $docFile (Join-Path $releaseDir "使用文档.md") -Force
     Write-Host "  - 使用文档.md" -ForegroundColor Green
 }
 

@@ -6,13 +6,19 @@ mod domain {
 
 mod repo {
     pub mod local_store {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/repo/local_store.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/repo/local_store.rs"
+        ));
     }
 }
 
 mod services {
     pub mod control_plane {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services/control_plane.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/services/control_plane.rs"
+        ));
     }
 }
 
@@ -52,8 +58,12 @@ fn control_plane_end_to_end_acceptance() {
     assert_eq!(task.status, "completed");
     assert!(!task.steps.is_empty());
     let retry_target = task.steps[0].id.clone();
-    let retried = control_plane::orchestrator_retry_step(&openclaw_dir, task.id.clone(), retry_target.clone())
-        .expect("orchestrator_retry_step");
+    let retried = control_plane::orchestrator_retry_step(
+        &openclaw_dir,
+        task.id.clone(),
+        retry_target.clone(),
+    )
+    .expect("orchestrator_retry_step");
     let retried_step = retried
         .steps
         .iter()
@@ -90,8 +100,9 @@ fn control_plane_end_to_end_acceptance() {
     .expect("save_skill_graph");
     let graphs = control_plane::list_skill_graphs(&openclaw_dir).expect("list_skill_graphs");
     assert!(!graphs.is_empty());
-    let graph_task = control_plane::execute_skill_graph(&openclaw_dir, graph.id.clone(), "input".to_string())
-        .expect("execute_skill_graph");
+    let graph_task =
+        control_plane::execute_skill_graph(&openclaw_dir, graph.id.clone(), "input".to_string())
+            .expect("execute_skill_graph");
     assert_eq!(graph_task.status, "completed");
 
     // 3) ticket hub
@@ -124,8 +135,12 @@ fn control_plane_end_to_end_acceptance() {
     )
     .expect("memory_write");
     assert_eq!(mem.layer, "project");
-    let mem_list = control_plane::memory_query(&openclaw_dir, Some("project".to_string()), Some("简洁".to_string()))
-        .expect("memory_query");
+    let mem_list = control_plane::memory_query(
+        &openclaw_dir,
+        Some("project".to_string()),
+        Some("简洁".to_string()),
+    )
+    .expect("memory_query");
     assert!(!mem_list.is_empty());
 
     // 5) sandbox
@@ -162,7 +177,8 @@ fn control_plane_end_to_end_acceptance() {
     .expect("snapshot_create");
     let snaps = control_plane::snapshot_list(&openclaw_dir).expect("snapshot_list");
     assert!(!snaps.is_empty());
-    let replay_task = control_plane::snapshot_replay(&openclaw_dir, snap.id.clone()).expect("snapshot_replay");
+    let replay_task =
+        control_plane::snapshot_replay(&openclaw_dir, snap.id.clone()).expect("snapshot_replay");
     assert_eq!(replay_task.status, "completed");
 
     // 8) promptops
@@ -173,12 +189,14 @@ fn control_plane_end_to_end_acceptance() {
         30,
     )
     .expect("promptops_create_version");
-    let activated = control_plane::promptops_activate(&openclaw_dir, pv.id.clone()).expect("promptops_activate");
+    let activated = control_plane::promptops_activate(&openclaw_dir, pv.id.clone())
+        .expect("promptops_activate");
     assert!(activated.iter().any(|v| v.id == pv.id && v.active));
 
     // 9) enterprise role + audit + cost
-    let role = control_plane::role_binding_set(&openclaw_dir, "u1".to_string(), "admin".to_string())
-        .expect("role_binding_set");
+    let role =
+        control_plane::role_binding_set(&openclaw_dir, "u1".to_string(), "admin".to_string())
+            .expect("role_binding_set");
     assert_eq!(role.role, "admin");
     let roles = control_plane::role_binding_list(&openclaw_dir).expect("role_binding_list");
     assert!(!roles.is_empty());

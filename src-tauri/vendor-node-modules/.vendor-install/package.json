@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "dingtalk-stream": "^2.1.4",
+    "zod": "^4.3.6"
+  }
+}

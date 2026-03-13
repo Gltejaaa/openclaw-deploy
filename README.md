@@ -1,35 +1,45 @@
 # OpenClaw 一键部署
 
-> 小白零门槛部署 [OpenClaw](https://github.com/openclaw/openclaw) 私人 AI 助手的 Windows 桌面工具
+> 面向 Windows 的 OpenClaw 图形化部署工具，帮助你更快完成安装、配置、启动与多渠道接入
 
 [![Tauri](https://img.shields.io/badge/Tauri-2.0-blue.svg)](https://tauri.app/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 ## 简介
 
-**OpenClaw 一键部署** 是一款图形化桌面应用，帮助你在 Windows 上快速安装、配置并启动 OpenClaw。无需手写配置文件，按向导三步即可完成部署。
+**OpenClaw 一键部署** 是一个面向普通用户的 Windows 桌面工具，用来简化 OpenClaw 的安装、模型配置、Gateway 启动和渠道接入流程。  
+你不需要手改配置文件，也不需要先熟悉命令行，按页面引导即可完成首轮部署。
 
-- **零门槛**：图形界面，无需命令行基础
-- **一键安装**：自动检测环境，通过 npm 全局安装 OpenClaw
-- **配置向导**：支持 Claude、GPT、DeepSeek、Kimi、阿里云百炼等，可配置自定义 API 地址（OneAPI、NewAPI 等）
-- **渠道配置**：Telegram、飞书、QQ 等渠道的图形化配置与配对
+- **上手快**：图形界面引导，适合第一次接触 OpenClaw 的用户
+- **部署省心**：自动检测环境并优先使用内置资源完成安装准备
+- **配置直观**：支持 Claude、GPT、DeepSeek、Kimi、阿里云百炼以及兼容 OpenAI 的自定义接口
+- **多渠道接入**：支持 Telegram、飞书、QQ、Discord、钉钉等渠道的图形化配置与配对
+- **适合受限网络环境**：可先下载发布包，再在无外网环境中完成安装阶段的主要操作
+
+## 适用场景
+
+- 第一次部署 OpenClaw，希望尽量少碰命令行
+- 需要统一管理模型配置、Agent、Gateway 和常用渠道
+- 机器处于受限网络环境，希望先下载好安装包再带到目标机器使用
+- 希望先快速跑通本地对话，再逐步接 Telegram、QQ、飞书等外部入口
 
 ## 功能概览
 
 | 功能 | 说明 |
 |------|------|
-| 环境检测 | 自动检测 Node.js（≥22）、npm、OpenClaw 安装状态 |
-| 一键安装 | 通过 npm 全局安装 OpenClaw |
+| 环境检测 | 自动检测 Node.js、npm、OpenClaw 安装状态 |
+| 安装准备 | 优先使用内置运行资源，失败时再回退在线安装 |
 | 配置向导 | AI 模型、API Key、自定义 API 地址 |
 | 启动服务 | 启动 Gateway 并自动打开对话网页 |
-| 渠道配置 | Telegram、飞书、QQ 等渠道配对 |
+| 渠道配置 | Telegram、飞书、QQ、Discord、钉钉等渠道配对 |
+| 修复排障 | 提供常见环境问题、依赖问题和运行状态排查入口 |
 
 ## 下载与安装
 
-### 方式一：安装包（推荐）
+### 方式一：安装版（推荐）
 
 1. 前往 [Releases](https://github.com/你的用户名/openclaw-deploy/releases) 下载最新版本
-2. 选择 **NSIS 安装包**（`.exe`）或 **MSI 安装包**（`.msi`）
+2. 选择 Windows 安装包（`.exe`）
 3. 运行安装程序，按提示完成安装
 
 ### 方式二：绿色版（免安装）
@@ -38,22 +48,22 @@
 2. 解压到任意目录
 3. 双击 `openclaw-deploy.exe` 运行
 
-压缩包内同时包含：
-- `openclaw-deploy.exe` - 主程序
-- `OpenClaw_Shell_Install.cmd` - Shell 安装/启动脚本（命令行用户可用）
-- `使用文档.md` - 详细使用说明与常见问题
+压缩包内通常包含：
+- `openclaw-deploy.exe`：主程序
+- `OpenClaw_Shell_Install.cmd`：命令行安装/启动脚本
+- `使用文档.md`：详细使用说明与常见问题
 
 ## 使用流程
 
 1. **安装 Node.js**（建议 v22 及以上）  
-   若未安装，请从 [Node.js 官网](https://nodejs.org/) 下载并安装。
+   若未安装，请先从 [Node.js 官网](https://nodejs.org/) 下载并安装。
 
 2. **打开本工具**，按向导完成：
    - 步骤 1：安装 OpenClaw
    - 步骤 2：配置 AI 模型（选择提供商、填入 API Key）
    - 步骤 3：点击「启动 Gateway 并自动打开对话网页」，浏览器会自动打开对话界面
 
-3. 如需 Telegram 等渠道，在「启动服务」页的渠道卡片中完成配对。
+3. 如需 Telegram、QQ、飞书等渠道，在对应页面完成凭据填写、测试连通与首次配对。
 
 ## Shell 脚本
 
@@ -68,8 +78,9 @@
 ### 环境要求
 
 - Node.js >= 18
-- Rust >= 1.70
-- Windows: Microsoft C++ Build Tools + WebView2
+- Rust（建议通过 `rustup` 安装）
+- Windows：Visual Studio 2022 Build Tools（含 C++ tools 与 Windows SDK）
+- WebView2 Runtime
 
 ### 构建步骤
 

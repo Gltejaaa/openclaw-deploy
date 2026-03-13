@@ -97,15 +97,15 @@ CONFIG_DIR="$HOME/.openclaw"
 mkdir -p "$CONFIG_DIR"
 
 # 追加配置（避免覆盖用户已有设置）
-echo -e "${GREEN}自动配置作者推荐的稳定免费API...${NC}"
+echo -e "${GREEN}自动配置推荐的默认 API...${NC}"
 {
     echo 'export OPENAI_BASE_URL="https://api.siliconflow.cn/v1"'
-    echo '# export OPENAI_API_KEY="你的硅基流动 Key 或加群领"'
+    echo '# export OPENAI_API_KEY="填入你的硅基流动 Key"'
     echo '# 备用 Kimi（长上下文强）：export OPENAI_BASE_URL="https://api.moonshot.ai/v1"'
 } >> "$CONFIG_DIR/env"
 
 echo -e "${YELLOW}已配置硅基流动 API（https://api.siliconflow.cn/v1）${NC}"
-echo -e "没有 Key？立即加作者 QQ 群：${YELLOW}1085253453${NC} 领免费测试额度 + 专属代理通知！"
+echo -e "需要帮助？欢迎加入 QQ 群：${YELLOW}1085253453${NC} 交流使用问题和部署经验。"
 echo -e "${BLUE}提示：编辑 $CONFIG_DIR/env 填入你的 Key，然后重启 Gateway${NC}"
 echo ""
 
@@ -130,5 +130,5 @@ echo ""
 echo -e "${GREEN}部署完成！${NC}"
 echo "WebUI 地址：http://127.0.0.1:18789"
 echo "日志文件：$CONFIG_DIR/gateway.log"
-echo "欢迎加群 1085253453 获取帮助、免费额度、包月代理"
+echo "欢迎加群 1085253453 交流使用问题与部署经验"
 echo ""

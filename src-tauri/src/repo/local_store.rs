@@ -23,13 +23,15 @@ pub fn load_state(openclaw_dir: &str) -> Result<ControlPlaneState, String> {
     if raw.trim().is_empty() {
         return Ok(ControlPlaneState::default());
     }
-    serde_json::from_str::<ControlPlaneState>(&raw).map_err(|e| format!("解析控制平面状态失败: {}", e))
+    serde_json::from_str::<ControlPlaneState>(&raw)
+        .map_err(|e| format!("解析控制平面状态失败: {}", e))
 }
 
 pub fn save_state(openclaw_dir: &str, state: &ControlPlaneState) -> Result<(), String> {
     let dir = control_plane_dir(openclaw_dir);
     fs::create_dir_all(&dir).map_err(|e| format!("创建控制平面目录失败: {}", e))?;
     let path = control_plane_state_file(openclaw_dir);
-    let body = serde_json::to_string_pretty(state).map_err(|e| format!("序列化控制平面状态失败: {}", e))?;
+    let body = serde_json::to_string_pretty(state)
+        .map_err(|e| format!("序列化控制平面状态失败: {}", e))?;
     fs::write(&path, body).map_err(|e| format!("写入控制平面状态失败: {}", e))
 }

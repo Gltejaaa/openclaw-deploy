@@ -1,6 +1,6 @@
 use crate::domain::models::*;
 use crate::repo::local_store::{load_state, save_state};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -59,8 +59,16 @@ fn default_capabilities() -> Vec<AgentCapability> {
             specialty: "code".to_string(),
             primary_model: "code-optimized".to_string(),
             fallback_model: Some("general-balanced".to_string()),
-            tools: vec!["filesystem".to_string(), "terminal".to_string(), "tests".to_string()],
-            strengths: vec!["代码实现".to_string(), "调试".to_string(), "重构".to_string()],
+            tools: vec![
+                "filesystem".to_string(),
+                "terminal".to_string(),
+                "tests".to_string(),
+            ],
+            strengths: vec![
+                "代码实现".to_string(),
+                "调试".to_string(),
+                "重构".to_string(),
+            ],
             max_cost_tier: "medium".to_string(),
             updated_at: now_iso_like(),
         },
@@ -70,7 +78,11 @@ fn default_capabilities() -> Vec<AgentCapability> {
             primary_model: "analysis-structured".to_string(),
             fallback_model: Some("general-balanced".to_string()),
             tools: vec!["csv".to_string(), "excel".to_string(), "calc".to_string()],
-            strengths: vec!["数据清洗".to_string(), "透视分析".to_string(), "公式设计".to_string()],
+            strengths: vec![
+                "数据清洗".to_string(),
+                "透视分析".to_string(),
+                "公式设计".to_string(),
+            ],
             max_cost_tier: "low".to_string(),
             updated_at: now_iso_like(),
         },
@@ -103,14 +115,23 @@ fn compute_route_decision(state: &ControlPlaneState, intent: &str) -> RouteDecis
                 || (intent == "sheet" && cap.specialty == "sheet")
                 || (intent == "vision" && cap.specialty == "vision")
                 || (intent == "general" && cap.specialty == "general")
-                || (intent == "hybrid_code_sheet" && (cap.specialty == "code" || cap.specialty == "sheet"));
+                || (intent == "hybrid_code_sheet"
+                    && (cap.specialty == "code" || cap.specialty == "sheet"));
             if specialty_match {
                 score += 0.6;
             }
-            if cap.strengths.iter().any(|s| intent.contains("code") && s.contains("代码")) {
+            if cap
+                .strengths
+                .iter()
+                .any(|s| intent.contains("code") && s.contains("代码"))
+            {
                 score += 0.1;
             }
-            if cap.strengths.iter().any(|s| intent.contains("sheet") && (s.contains("数据") || s.contains("透视"))) {
+            if cap
+                .strengths
+                .iter()
+                .any(|s| intent.contains("sheet") && (s.contains("数据") || s.contains("透视")))
+            {
                 score += 0.1;
             }
             RouteScoreItem {
@@ -120,7 +141,11 @@ fn compute_route_decision(state: &ControlPlaneState, intent: &str) -> RouteDecis
             }
         })
         .collect();
-    scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scores.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let selected = scores
         .first()
         .map(|x| x.agent_id.clone())
@@ -133,7 +158,11 @@ fn compute_route_decision(state: &ControlPlaneState, intent: &str) -> RouteDecis
     }
 }
 
-pub fn orchestrator_submit_task(openclaw_dir: &str, title: String, input: String) -> Result<OrchestratorTask, String> {
+pub fn orchestrator_submit_task(
+    openclaw_dir: &str,
+    title: String,
+    input: String,
+) -> Result<OrchestratorTask, String> {
     let mut state = load_state(openclaw_dir)?;
     ensure_capabilities(&mut state);
     let intent = infer_intent(&input);
@@ -225,7 +254,11 @@ pub fn capabilities_upsert(
 ) -> Result<AgentCapability, String> {
     let mut state = load_state(openclaw_dir)?;
     ensure_capabilities(&mut state);
-    if let Some(existing) = state.agent_capabilities.iter_mut().find(|x| x.agent_id == agent_id) {
+    if let Some(existing) = state
+        .agent_capabilities
+        .iter_mut()
+        .find(|x| x.agent_id == agent_id)
+    {
         existing.specialty = specialty;
         existing.primary_model = primary_model;
         existing.fallback_model = fallback_model;
@@ -257,7 +290,11 @@ pub fn orchestrator_list_tasks(openclaw_dir: &str) -> Result<Vec<OrchestratorTas
     Ok(state.tasks)
 }
 
-pub fn orchestrator_retry_step(openclaw_dir: &str, task_id: String, step_id: String) -> Result<OrchestratorTask, String> {
+pub fn orchestrator_retry_step(
+    openclaw_dir: &str,
+    task_id: String,
+    step_id: String,
+) -> Result<OrchestratorTask, String> {
     let mut state = load_state(openclaw_dir)?;
     let task = state
         .tasks
@@ -308,7 +345,12 @@ pub fn verifier_check_output(output: String, constraints: Vec<String>) -> Verifi
     }
 }
 
-pub fn save_skill_graph(openclaw_dir: &str, name: String, nodes: Vec<GraphNode>, edges: Vec<GraphEdge>) -> Result<SkillGraph, String> {
+pub fn save_skill_graph(
+    openclaw_dir: &str,
+    name: String,
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+) -> Result<SkillGraph, String> {
     let mut state = load_state(openclaw_dir)?;
     let graph = SkillGraph {
         id: make_id("graph"),
@@ -327,7 +369,11 @@ pub fn list_skill_graphs(openclaw_dir: &str) -> Result<Vec<SkillGraph>, String> 
     Ok(state.skill_graphs)
 }
 
-pub fn execute_skill_graph(openclaw_dir: &str, graph_id: String, input: String) -> Result<OrchestratorTask, String> {
+pub fn execute_skill_graph(
+    openclaw_dir: &str,
+    graph_id: String,
+    input: String,
+) -> Result<OrchestratorTask, String> {
     let state = load_state(openclaw_dir)?;
     let graph = state
         .skill_graphs
@@ -340,7 +386,10 @@ pub fn execute_skill_graph(openclaw_dir: &str, graph_id: String, input: String) 
         indeg.insert(n.id.clone(), 0);
     }
     for e in &graph.edges {
-        outgoing.entry(e.from.clone()).or_default().push(e.to.clone());
+        outgoing
+            .entry(e.from.clone())
+            .or_default()
+            .push(e.to.clone());
         *indeg.entry(e.to.clone()).or_insert(0) += 1;
     }
     let mut ready: Vec<String> = indeg
@@ -472,24 +521,38 @@ pub fn memory_write(
     Ok(m)
 }
 
-pub fn memory_query(openclaw_dir: &str, layer: Option<String>, q: Option<String>) -> Result<Vec<MemoryRecord>, String> {
+pub fn memory_query(
+    openclaw_dir: &str,
+    layer: Option<String>,
+    q: Option<String>,
+) -> Result<Vec<MemoryRecord>, String> {
     let state = load_state(openclaw_dir)?;
     let kw = q.unwrap_or_default().to_lowercase();
     let out: Vec<MemoryRecord> = state
         .memory_records
         .into_iter()
         .filter(|m| layer.as_ref().map(|l| &m.layer == l).unwrap_or(true))
-        .filter(|m| kw.is_empty() || m.content.to_lowercase().contains(&kw) || m.rationale.to_lowercase().contains(&kw))
+        .filter(|m| {
+            kw.is_empty()
+                || m.content.to_lowercase().contains(&kw)
+                || m.rationale.to_lowercase().contains(&kw)
+        })
         .collect();
     Ok(out)
 }
 
 pub fn sandbox_preview(action_type: String, resource: String) -> SandboxPreview {
-    let risky = action_type.contains("write") || action_type.contains("delete") || action_type.contains("network");
+    let risky = action_type.contains("write")
+        || action_type.contains("delete")
+        || action_type.contains("network");
     SandboxPreview {
         action_type,
         resource: resource.clone(),
-        risk_level: if risky { "high".to_string() } else { "low".to_string() },
+        risk_level: if risky {
+            "high".to_string()
+        } else {
+            "low".to_string()
+        },
         requires_approval: risky,
         plan: vec![
             format!("校验权限: {}", resource),
@@ -499,7 +562,12 @@ pub fn sandbox_preview(action_type: String, resource: String) -> SandboxPreview 
     }
 }
 
-pub fn sandbox_execute(openclaw_dir: &str, action_type: String, resource: String, approved: bool) -> Result<String, String> {
+pub fn sandbox_execute(
+    openclaw_dir: &str,
+    action_type: String,
+    resource: String,
+    approved: bool,
+) -> Result<String, String> {
     let preview = sandbox_preview(action_type.clone(), resource.clone());
     if preview.requires_approval && !approved {
         return Err("该操作需要审批确认".to_string());
@@ -568,7 +636,10 @@ pub fn snapshot_list(openclaw_dir: &str) -> Result<Vec<TaskSnapshot>, String> {
     Ok(state.snapshots)
 }
 
-pub fn snapshot_replay(openclaw_dir: &str, snapshot_id: String) -> Result<OrchestratorTask, String> {
+pub fn snapshot_replay(
+    openclaw_dir: &str,
+    snapshot_id: String,
+) -> Result<OrchestratorTask, String> {
     let state = load_state(openclaw_dir)?;
     let snap = state
         .snapshots
@@ -620,7 +691,10 @@ pub fn promptops_create_version(
     Ok(v)
 }
 
-pub fn promptops_activate(openclaw_dir: &str, version_id: String) -> Result<Vec<PromptPolicyVersion>, String> {
+pub fn promptops_activate(
+    openclaw_dir: &str,
+    version_id: String,
+) -> Result<Vec<PromptPolicyVersion>, String> {
     let mut state = load_state(openclaw_dir)?;
     for v in &mut state.prompt_versions {
         v.active = v.id == version_id;
@@ -635,9 +709,17 @@ pub fn promptops_list(openclaw_dir: &str) -> Result<Vec<PromptPolicyVersion>, St
     Ok(state.prompt_versions)
 }
 
-pub fn role_binding_set(openclaw_dir: &str, user_id: String, role: String) -> Result<RoleBinding, String> {
+pub fn role_binding_set(
+    openclaw_dir: &str,
+    user_id: String,
+    role: String,
+) -> Result<RoleBinding, String> {
     let mut state = load_state(openclaw_dir)?;
-    if let Some(existing) = state.role_bindings.iter_mut().find(|x| x.user_id == user_id) {
+    if let Some(existing) = state
+        .role_bindings
+        .iter_mut()
+        .find(|x| x.user_id == user_id)
+    {
         existing.role = role;
         existing.updated_at = now_iso_like();
         let out = existing.clone();

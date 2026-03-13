@@ -1,0 +1,31 @@
+必带
+直接复制整个项目目录：C:\Users\Administrator\Desktop\openclow
+再单独确认这两个产物也在：
+C:\Users\Administrator\Desktop\openclow\release
+C:\Users\Administrator\Desktop\openclow\OpenClaw-Deploy-v2.0.0-Windows.zip
+只要整个 openclow 文件夹在，源码、src-tauri/resources/bundled-openclaw、以及当前内置插件资源都会一起保住。你这个工程现在内置的是 discord、feishu、openclaw-dingtalk、qqbot，不含 telegram。
+可选带走
+C:\Users\Administrator\Desktop\openclow\node_modules
+带走后重装回来能少下一次前端依赖，不带也没事。
+C:\Users\Administrator\.openclaw
+C:\Users\Administrator\openclaw\.openclaw
+这两个如果以后出现，也建议一起备份，它们是 OpenClaw 的本地配置目录。
+不用太在意
+C:\Users\Administrator\Desktop\openclow\src-tauri\target
+C:\Users\Administrator\Desktop\openclow\dist
+这两个可以重新生成，U 盘空间紧张时可以不带。
+重装后还得重装的环境
+这些系统依赖不能靠“复制工程”带走，必须重新装：
+Node.js 和 npm
+Git
+Rustup / Cargo
+Visual Studio 2022 Build Tools，带 C++ 工作负载和 Windows SDK
+WebView2 Runtime
+你现在 exe 白屏，我仍然更怀疑是系统里的 WebView2/Tauri 宿主环境问题，所以重装后这个问题大概率会比现在好。
+恢复时怎么用
+把 openclow 整个文件夹复制回电脑，放桌面或别的目录都可以。
+如果你备份了 node_modules，通常可以直接继续开发。
+如果没备份 node_modules，先在项目根目录执行 npm install。
+要重新打包，再装好上面那套系统环境。
+一句话说透：
+整个工程可以靠复制保住，系统环境依赖不能靠复制保住。

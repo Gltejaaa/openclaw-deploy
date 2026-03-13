@@ -38,7 +38,7 @@
 
 ### 方式一：安装版（推荐）
 
-1. 前往 [Releases](https://github.com/你的用户名/openclaw-deploy/releases) 下载最新版本
+1. 前往 [Releases](https://github.com/3445286649/openclaw-deploy/releases) 下载最新版本
 2. 选择 Windows 安装包（`.exe`）
 3. 运行安装程序，按提示完成安装
 
@@ -65,6 +65,23 @@
 
 3. 如需 Telegram、QQ、飞书等渠道，在对应页面完成凭据填写、测试连通与首次配对。
 
+## Linux / macOS 一键脚本
+
+如果你需要在 Linux 或 macOS 上直接拉取并执行安装脚本，可以使用：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/3445286649/openclaw-deploy/main/install.sh | bash
+```
+
+如果希望进入交互式菜单模式，可以使用：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/3445286649/openclaw-deploy/main/install.sh | bash -s menu
+```
+
+- 第一条：直接执行一键安装
+- 第二条：进入交互式菜单后再选择操作
+
 ## Shell 脚本
 
 除图形界面外，还提供 `OpenClaw_Shell_Install.cmd` 脚本，用于在命令行中安装并启动 OpenClaw：
@@ -86,7 +103,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/你的用户名/openclaw-deploy.git
+git clone https://github.com/3445286649/openclaw-deploy.git
 cd openclaw-deploy
 
 # 安装依赖
